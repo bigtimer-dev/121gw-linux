@@ -52,28 +52,40 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 Vibration feedback from the mobile apps has no PC equivalent and is omitted. The original Xamarin app’s
 multi-meter tabs aren’t carried over either; like all the evotronix ports, this app connects to one meter.
 
-## Requirements
+## Install
 
-- Python ≥ 3.10, PyGObject, GTK ≥ 4.12, libadwaita ≥ 1.6, pycairo
+One command: it checks/installs the dependencies (Arch, Debian/Ubuntu, Fedora, openSUSE), downloads the
+app and adds **121GW Multimeter** to your app launcher. No root needed except for missing system packages.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bigtimer-dev/121gw-linux/main/install.sh | bash
+```
+
+Or from a clone:
+
+```sh
+git clone https://github.com/bigtimer-dev/121gw-linux.git
+cd 121gw-linux
+./install.sh
+```
+
+Then open **121GW Multimeter** from your launcher, or run `121gw` (`121gw --demo` without a meter).
+Run the same command again to update. Uninstall with `./install.sh --uninstall`
+(or `curl … | bash -s -- --uninstall`). Installer options: `--yes` (install missing packages without asking),
+`--no-deps` (skip the dependency check).
+
+### Requirements
+
+- Python ≥ 3.10, PyGObject, pycairo, GTK ≥ 4.12, libadwaita ≥ 1.6
+  (Arch, Fedora 41+, Ubuntu 25.04+, Debian 13+, openSUSE Tumbleweed)
 - BlueZ (`bluetooth.service` running) and a Bluetooth LE adapter
-- For sound: `pw-play`, `paplay` or `aplay`
+- For the continuity beep: `pw-play`, `paplay` or `aplay`
 
-Arch: `sudo pacman -S python-gobject python-cairo gtk4 libadwaita bluez bluez-utils`
-Debian/Ubuntu (24.10+): `sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 bluez`
-Fedora: `sudo dnf install python3-gobject python3-cairo gtk4 libadwaita bluez`
-
-## Run
+### Run without installing
 
 ```sh
 python3 -m gw121          # real meter
 python3 -m gw121 --demo   # simulated meter
-```
-
-Install for your user (launcher in `~/.local/bin`, desktop entry and icon):
-
-```sh
-./install.sh              # then run `121gw` or open "121GW Multimeter" from the launcher
-./install.sh --uninstall
 ```
 
 ## Connecting the meter
