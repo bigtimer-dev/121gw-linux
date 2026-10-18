@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=121GW Multimeter
+GenericName=Multimeter
+Comment=Live display, remote control and logging for the EEVblog 121GW over Bluetooth LE
+Exec=@BIN@
+Icon=io.github.bigtimer_dev.Meter121GW
+Terminal=false
+Categories=Electronics;Engineering;Utility;
+Keywords=multimeter;121GW;EEVblog;bluetooth;BLE;logging;
+StartupWMClass=io.github.bigtimer_dev.Meter121GW
+Actions=demo;
+
+[Desktop Action demo]
+Name=Demo meter (no hardware)
+Exec=@BIN@ --demo
