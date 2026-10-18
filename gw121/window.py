@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from collections import deque
 from datetime import datetime
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
@@ -14,7 +13,7 @@ from .keys import KEYPAD, MeterKey
 from .lcd import LcdView
 from .link import MeterLink
 from .packet import PacketV2
-from .sessions import DataPoint, Session, SessionStore, default_session_name
+from .sessions import LIVE_WINDOW, DataPoint, Session, SessionStore, default_session_name
 from .settings import Settings
 
 PREVIEW_POINTS = 600
@@ -100,7 +99,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings = settings
         self.store = store
         self.continuity = ContinuityEngine(settings)
-        self.preview: deque[DataPoint] = deque(maxlen=PREVIEW_POINTS)
+        # append-only so the chart summary stays incremental; trimmed only occasionally
+        self.preview: list[DataPoint] = []
         self._preview_fp: str | None = None
         self._last_synced_beep: float | None = None
         self._dialog_open = False
@@ -456,16 +456,18 @@ class MainWindow(Adw.ApplicationWindow):
         if math.isfinite(pkt.main_value):
             fp = pkt.measure_fingerprint
             if fp != self._preview_fp:
-                self.preview.clear()
+                self.preview = []
                 self._preview_fp = fp
+            elif len(self.preview) >= PREVIEW_POINTS * 4:
+                self.preview = self.preview[-PREVIEW_POINTS:]
             self.preview.append(DataPoint.from_packet(pkt))
 
         self.live_chart.empty_text = ("Overload (OL) – nothing to plot" if pkt.is_main_overflow
                                       else "No samples yet")
         if self.store.is_logging:
-            self.live_chart.set_data(self.store.live_window, pkt.graph_unit)
+            self.live_chart.set_data(self.store.current, pkt.graph_unit, window=LIVE_WINDOW)
         else:
-            self.live_chart.set_data(list(self.preview), pkt.graph_unit)
+            self.live_chart.set_data(self.preview, pkt.graph_unit, window=PREVIEW_POINTS)
         self._refresh_log_ui()
 
     def _sync_continuity_threshold(self, pkt: PacketV2) -> None:
@@ -604,7 +606,7 @@ class MainWindow(Adw.ApplicationWindow):
             unit = s.current[-1].plot_unit if s.current else ""
             self.trend_stats.set_label(f"min {fmt_num(s.live_min)}  max {fmt_num(s.live_max)} {unit}")
         elif not s.is_logging and self.preview:
-            vals = [p.plot_value for p in self.preview if math.isfinite(p.plot_value)]
+            vals = [p.plot_value for p in self.preview[-PREVIEW_POINTS:] if math.isfinite(p.plot_value)]
             if vals:
                 self.trend_stats.set_label(f"min {fmt_num(min(vals))}  max {fmt_num(max(vals))} "
                                            f"{self.preview[-1].plot_unit}")

@@ -178,10 +178,6 @@ class SessionStore:
                 self.live_max = pt.plot_value
         return True
 
-    @property
-    def live_window(self) -> list[DataPoint]:
-        return self.current[-LIVE_WINDOW:]
-
     def save_current(self, name: str, notes: str = "") -> Session | None:
         if not self.current:
             return None
