@@ -5,16 +5,18 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable
 
 from gi.repository import GLib
 
-from .keys import MeterKey
+from .keys import MeterKey, clock_payload
 from .packet import FrameAssembler, PacketV2
 
 COMM_TIMEOUT = 5.0
 BATTERY_LOW_V = 4.5
 BATTERY_POWER_OFF_V = 4.2
+CLOCK_REPLY_MS = 3000   # the meter echoes a set-clock frame within a few frames
 
 
 @dataclass
@@ -52,6 +54,13 @@ class MeterLink:
         self._packet_listeners: list[Callable[[PacketV2], None]] = []
         self._change_listeners: list[Callable[[], None]] = []
         self._change_pending = False
+        self._clock_frame: bytes | None = None
+        self._clock_when: datetime | None = None
+        self._clock_cb: Callable[[str], None] | None = None
+        self._clock_tail = bytearray()
+        self._clock_timer = 0
+        self._clock_repeat = False
+        self._clock_synced = False      # a clock frame was echoed on this connection
 
     # ---- observers ---------------------------------------------------------
 
@@ -114,6 +123,8 @@ class MeterLink:
         return GLib.SOURCE_CONTINUE
 
     def ingest(self, data: bytes) -> None:
+        if self._clock_frame is not None:
+            self._match_clock_echo(data)
         packets = self._assembler.feed(data)
         if packets:
             self._publish(packets[-1])
@@ -139,6 +150,8 @@ class MeterLink:
         self.connecting = False
         self.in_setup_menu = False
         self._last_packet_at = None
+        self._clock_finish("Clock update cancelled: disconnected")
+        self._clock_synced = False
 
     def note_key(self, key: MeterKey) -> None:
         """Track whether the meter is in its SETUP menu (REL/PEAK act as arrows there)."""
@@ -152,6 +165,57 @@ class MeterLink:
             return "Backlight"
         return f"Hold {key.title}" if long_press else f"Sent {key.title}"
 
+    # ---- meter clock -------------------------------------------------------
+
+    def sync_clock(self, on_result: Callable[[str], None]) -> None:
+        """Set the meter's clock to this computer's local time; on_result gets one line for the user."""
+        if not self.is_connected:
+            on_result("Not connected")
+            return
+        self._clock_finish(None)
+        when = datetime.now()
+        self._clock_frame = clock_payload(when)
+        self._clock_when = when
+        self._clock_cb = on_result
+        self._clock_repeat = self._clock_synced
+        self._clock_tail.clear()
+        self._clock_timer = GLib.timeout_add(CLOCK_REPLY_MS, self._clock_timed_out)
+        self.write_frame(self._clock_frame, self._clock_written)
+
+    def _clock_written(self, error: str | None) -> None:
+        if error:
+            self._clock_finish(f"Clock not sent: {error}")
+
+    def _match_clock_echo(self, data: bytes) -> None:
+        frame, tail = self._clock_frame, self._clock_tail
+        tail += data
+        if frame in tail:
+            self._clock_synced = True
+            when = self._clock_when
+            if self._clock_repeat:
+                text = ("Already synced: the meter takes one clock update each time its Bluetooth is switched on "
+                        "(hold PEAK)")
+            else:
+                text = f"Meter clock set to {when:%H:%M:%S}, {when:%Y-%m-%d}"
+            self._clock_finish(text)
+        elif len(tail) >= len(frame):
+            del tail[: len(tail) - len(frame) + 1]
+
+    def _clock_timed_out(self) -> bool:
+        self._clock_timer = 0
+        self._clock_finish("The meter did not confirm the clock update")
+        return GLib.SOURCE_REMOVE
+
+    def _clock_finish(self, text: str | None) -> None:
+        if self._clock_timer:
+            GLib.source_remove(self._clock_timer)
+            self._clock_timer = 0
+        cb = self._clock_cb
+        self._clock_frame = self._clock_cb = None
+        self._clock_tail.clear()
+        if cb is not None and text:
+            cb(text)
+
     # ---- transport API (overridden) ----------------------------------------
 
     def start(self) -> None: ...
@@ -161,5 +225,6 @@ class MeterLink:
     def power_on(self) -> None: ...
     def disconnect(self) -> None: ...
     def send_key(self, key: MeterKey, long_press: bool = False) -> None: ...
+    def write_frame(self, payload: bytes, done: Callable[[str | None], None] | None = None) -> None: ...
     def set_auto_reconnect(self, value: bool) -> None: ...
     def shutdown(self) -> None: ...

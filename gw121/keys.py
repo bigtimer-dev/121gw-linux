@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 
 
@@ -35,3 +36,20 @@ KEYPAD = [
     MeterKey.HOLD, MeterKey.MODE, MeterKey.REL, MeterKey.RANGE,
     MeterKey.MIN_MAX, MeterKey.MEM, MeterKey.PEAK, MeterKey.SETUP,
 ]
+
+
+def clock_payload(when: datetime) -> bytes:
+    """Set-clock frame (15 bytes): 0xF8, then year - 2000, month, day, hour, minute, second and the XOR of those six,
+    each as two upper-case ASCII hex digits.
+
+    The meter echoes a valid frame. It applies the first one after power-on or after its Bluetooth is switched on
+    (PEAK long press) and ignores further ones until Bluetooth is switched off and on again. Same frame and rule on
+    the original v2.05 firmware and on zombu4's open firmware.
+    """
+    if not 2000 <= when.year <= 2099:
+        raise ValueError(f"the meter's clock holds the years 2000-2099, not {when.year}")
+    fields = [when.year - 2000, when.month, when.day, when.hour, when.minute, when.second]
+    check = 0
+    for f in fields:
+        check ^= f
+    return b"\xF8" + "".join(f"{f:02X}" for f in fields + [check]).encode("ascii")

@@ -119,6 +119,7 @@ class MainWindow(Adw.ApplicationWindow):
         switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         header.set_title_widget(switcher)
         menu = Gio.Menu()
+        menu.append("Sync Meter Clock", "win.sync-clock")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("About 121GW", "app.about")
         menu.append("Quit", "app.quit")
@@ -133,6 +134,9 @@ class MainWindow(Adw.ApplicationWindow):
         act = Gio.SimpleAction.new("shortcuts", None)
         act.connect("activate", lambda *_: self._show_shortcuts())
         self.add_action(act)
+        self.clock_action = Gio.SimpleAction.new("sync-clock", None)
+        self.clock_action.connect("activate", lambda *_: self._sync_clock())
+        self.add_action(self.clock_action)
 
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -197,6 +201,12 @@ class MainWindow(Adw.ApplicationWindow):
             self.key_buttons.append(b)
             grid.attach(b, i % 4, i // 4, 1, 1)
         ctl.append(grid)
+        clock = Gtk.Button(action_name="win.sync-clock", halign=Gtk.Align.START,
+                           tooltip_text="Set the meter's clock to this computer's time (Ctrl+T). The meter takes "
+                                        "one clock update each time its Bluetooth is switched on.")
+        clock.set_child(Adw.ButtonContent(icon_name="preferences-system-time-symbolic", label="Sync Meter Clock"))
+        clock.add_css_class("flat")
+        ctl.append(clock)
         box.append(_card(ctl, 10))
 
         # trend
@@ -533,6 +543,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_temp_toggle(p.sub_unit)
         else:
             self.lcd.clear(link.status_text)
+        self.clock_action.set_enabled(link.is_connected)
         for b in self.key_buttons:
             b.set_sensitive(link.is_connected)
             b.set_setup_mode(link.in_setup_menu)
@@ -701,6 +712,9 @@ class MainWindow(Adw.ApplicationWindow):
             if name == "l":
                 self._toggle_log()
                 return True
+            if name == "t":
+                self._sync_clock()
+                return True
             pages = {"1": "live", "2": "sessions", "3": "connect"}
             if name in pages:
                 self.stack.set_visible_child_name(pages[name])
@@ -723,10 +737,14 @@ class MainWindow(Adw.ApplicationWindow):
     def _show_shortcuts(self) -> None:
         lines = "\n".join(f"<b>{k.shortcut.upper()}</b>\t{k.title}" for k in KEYPAD)
         body = (f"{lines}\n\n<b>Shift</b>+key\tlong press\n<b>↑ / ↓</b>\tREL / PEAK in SETUP\n"
-                "<b>Ctrl+L</b>\tstart / stop log\n<b>Ctrl+1/2/3</b>\tLive / Sessions / Connect\n<b>Ctrl+Q</b>\tquit")
+                "<b>Ctrl+L</b>\tstart / stop log\n<b>Ctrl+T</b>\tsync meter clock\n<b>Ctrl+1/2/3</b>\tLive / Sessions / Connect\n<b>Ctrl+Q</b>\tquit")
         d = Adw.AlertDialog(heading="Keyboard Shortcuts", body=body, body_use_markup=True)
         d.add_response("ok", "Close")
         d.present(self)
+
+    def _sync_clock(self) -> None:
+        if self.link.is_connected:
+            self.link.sync_clock(self.toast)
 
     def toast(self, text: str) -> None:
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=3))

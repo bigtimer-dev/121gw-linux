@@ -494,21 +494,28 @@ class BluezLink(MeterLink):
 
     # ---- keys --------------------------------------------------------------
 
+    def write_frame(self, payload: bytes, done=None) -> None:
+        """Write a command frame to the meter; done(error message or None) after BlueZ answers."""
+        target = self.write_char or self.notify_char
+        if not self.is_connected or not target:
+            if done:
+                done("Not connected" if not self.is_connected else "No write characteristic")
+            return
+        params = GLib.Variant("(aya{sv})", (payload, {"type": GLib.Variant("s", self.write_type)}))
+
+        def finished(_res, err):
+            if done:
+                done(err.message.split(":")[-1].strip() if err else None)
+
+        self._call(target, IFACE_CHAR, "WriteValue", params, finished)
+
     def send_key(self, key: MeterKey, long_press: bool = False) -> None:
         if not self.is_connected:
             self.set_status("Not connected")
             return
         self.note_key(key)
-        target = self.write_char or self.notify_char
-        if not target:
-            self.set_status("No write characteristic")
-            return
-        params = GLib.Variant("(aya{sv})", (key.payload(long_press), {"type": GLib.Variant("s", self.write_type)}))
 
-        def done(_res, err):
-            if err:
-                self.set_status(f"Write failed: {err.message.split(':')[-1].strip()}")
-            else:
-                self.set_status(self.key_status(key, long_press))
+        def done(err):
+            self.set_status(f"Write failed: {err}" if err else self.key_status(key, long_press))
 
-        self._call(target, IFACE_CHAR, "WriteValue", params, done)
+        self.write_frame(key.payload(long_press), done)

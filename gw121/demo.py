@@ -82,6 +82,8 @@ class DemoLink(MeterLink):
         self.setup_page: int | None = None
         self._last_value = 0.0
         self._minmax_vals: list[float] = []
+        # meter clock, unset like a fresh 121GW until the app syncs it
+        self._clock_offset = time.mktime((2004, 1, 1, 0, 0, 0, 0, 0, -1)) - time.time()
 
     def start(self) -> None:
         self.devices[DEMO_ADDRESS] = DiscoveredDevice(DEMO_ADDRESS, "121GW (demo)", rssi=-58)
@@ -140,6 +142,33 @@ class DemoLink(MeterLink):
         if self._timer:
             GLib.source_remove(self._timer)
         self._stop_watchdog()
+
+    # ---- commands ----------------------------------------------------------
+
+    def write_frame(self, payload: bytes, done=None) -> None:
+        if not self.is_connected:
+            if done:
+                done("Not connected")
+            return
+        if len(payload) == 15 and payload[0] == 0xF8:
+            try:
+                v = [int(payload[i:i + 2], 16) for i in range(1, 15, 2)]
+            except ValueError:
+                v = []
+            x = 0
+            for b in v[:6]:
+                x ^= b
+            if len(v) == 7 and x == v[6]:
+                when = time.mktime((2000 + v[0], v[1], v[2], v[3], v[4], v[5], 0, 0, -1))
+                self._clock_offset = when - time.time()
+                GLib.timeout_add(150, self._echo, bytes(payload))     # the meter echoes the frame
+        if done:
+            done(None)
+
+    def _echo(self, payload: bytes) -> bool:
+        if self.is_connected:
+            self.ingest(payload)
+        return GLib.SOURCE_REMOVE
 
     # ---- keys --------------------------------------------------------------
 
@@ -225,7 +254,7 @@ class DemoLink(MeterLink):
         sub_mode, sub_val, sub_pt = 0, 0, 0
         if self.setup_page is not None:
             sub_mode = self.setup_page
-            now = time.localtime()
+            now = time.localtime(time.time() + self._clock_offset)
             sub_val, sub_pt = {
                 110: (round(5.08 * 100), 2),
                 140: ((now.tm_hour << 8) | now.tm_min, 0),

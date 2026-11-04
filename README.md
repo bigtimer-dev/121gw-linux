@@ -23,6 +23,10 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
   as desktop notifications when the window is in the background
 - Remote keys HOLD / MODE / REL▲ / RANGE / MIN-MAX / MEM / PEAK▼ / SETUP with short and long press
   (MODE long ≈ backlight); REL / PEAK act as ▲ / ▼ in the SETUP menu
+- **Sync Meter Clock** (button under the keys, main menu or `Ctrl+T`): sets the meter's clock to the computer's
+  local time, so SD-card log files get the right date. The meter confirms by echoing the frame. It takes one clock
+  update each time its Bluetooth is switched on: to sync again, hold **PEAK** on the meter (Bluetooth off), hold it
+  again (on) and sync.
 - Trend chart: Y axis follows the meter mode/range (or “Auto Y”), mouse-wheel zoom, drag to pan,
   double-click to reset, hover readout, dashed internal-temperature trace with show/hide toggle.
   It shows a rolling preview before logging starts and the full 25,000-sample window while logging.
@@ -47,7 +51,7 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 - `--demo` simulated meter (real frames through the real parser, reacts to the keys) to try the app
   without hardware
 - Keyboard shortcuts: `H` HOLD, `M` MODE, `R` REL, `G` RANGE, `X` MIN/MAX, `E` MEM, `P` PEAK, `S` SETUP,
-  `Shift`+key = long press, `↑/↓` in SETUP, `Ctrl+L` log, `Ctrl+1/2/3` tabs
+  `Shift`+key = long press, `↑/↓` in SETUP, `Ctrl+L` log, `Ctrl+T` sync clock, `Ctrl+1/2/3` tabs
 
 Vibration feedback from the mobile apps has no PC equivalent and is omitted. The original Xamarin app’s
 multi-meter tabs aren’t carried over either; like all the evotronix ports, this app connects to one meter.
@@ -96,6 +100,24 @@ python3 -m gw121 --demo   # simulated meter
 3. The app connects automatically (auto-reconnect), or press **Scan** on the Connect tab and pick the meter.
    Pairing is not needed.
 
+## Meter firmware
+
+Works with EEVblog's original firmware **v2.05** and with
+[zombu4's open firmware](https://github.com/zombu4/121GW-Open-Firmware) (fast builds `F-0.9x`, and the bug-fix build
+`C-0.94` from [bigtimer-dev/121GW-Open-Firmware](https://github.com/bigtimer-dev/121GW-Open-Firmware)). The open
+firmware keeps the Bluetooth frame format, the key codes and the clock frame unchanged. Checked against `C-0.94`
+running in zombu4's emulator, with the app's own decoder and key frames:
+
+- every frame decoded at the default 2 readings/s and at the open firmware's fastest **20 readings/s** (SETUP page
+  `bt`); the continuity beep is rate-limited, so the faster rate adds no beep storm
+- the new SETUP pages (`bL`, `bt`, `rEL`, `dSP`, `CL`, `Lt`, `Lo`, `HI`, `tr`, the limit-test verdict) decode without
+  errors; their sub-display is sent as zero, so the app shows the main reading only
+- overload: the open firmware sends the real bar segment count (at most 25), where v2.05 sent out-of-range values
+- HOLD, MIN/MAX and REL from the app work; while the open firmware's limit test (`Lt`) runs, the meter refuses them on
+  purpose, exactly as for the buttons on the meter
+- REL in percent and the dBm reference change only the meter's own display; the app shows the classic REL value
+  and dBm
+
 ## Files
 
 | What | Where |
@@ -110,6 +132,9 @@ python3 -m gw121 --demo   # simulated meter
 - 19-byte frames: `0xF2`, …, XOR checksum of bytes 0–17 in byte 18 (`gw121/packet.py`)
 - Keys: `F4 k c k c`, `k = 0x30` short / `0x38` long, `c = 0x31…0x38` (RANGE, HOLD, REL, PEAK, MODE,
   MIN/MAX, MEM, SETUP)
+- Clock: `F8` + year − 2000, month, day, hour, minute, second and their XOR, each as two upper-case ASCII hex
+  digits (15 bytes, `gw121/keys.py` `clock_payload`). The meter echoes the frame and applies the first valid one
+  after power-on or after its Bluetooth is switched on.
 
 ## Development
 
