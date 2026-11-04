@@ -826,10 +826,10 @@ class PacketV2:
             (M.AC_MVA, M.DC_MVA): [25, 250, 2500, 25_000],
             (M.AC_VA, M.DC_VA): [50, 500],
         }
-        if m in (M.TEMP, M.TEMP_C):
-            return 1350.0
-        if m == M.TEMP_F:
-            return 2450.0
+        if m in (M.TEMP, M.TEMP_C, M.TEMP_F):
+            # K reaches 1350 °C (2450 °F); the open firmware's R / S thermocouples reach 1760 °C (3200 °F)
+            k_max, rs_max = (2450.0, 3300.0) if m == M.TEMP_F else (1350.0, 1800.0)
+            return rs_max if abs(self.graph_value) > k_max else k_max   # NaN: k_max
         if m == M.DUTY:
             return 100.0
         if m == M.CONTINUITY:

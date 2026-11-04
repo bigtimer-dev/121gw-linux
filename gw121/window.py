@@ -15,6 +15,7 @@ from .link import MeterLink
 from .packet import PacketV2
 from .sessions import LIVE_WINDOW, DataPoint, Session, SessionStore, default_session_name
 from .settings import Settings
+from .views import view_for
 
 PREVIEW_POINTS = 600
 
@@ -120,6 +121,7 @@ class MainWindow(Adw.ApplicationWindow):
         header.set_title_widget(switcher)
         menu = Gio.Menu()
         menu.append("Sync Meter Clock", "win.sync-clock")
+        menu.append_submenu("Meter Views", self._views_menu())
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("About 121GW", "app.about")
         menu.append("Quit", "app.quit")
@@ -137,6 +139,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.clock_action = Gio.SimpleAction.new("sync-clock", None)
         self.clock_action.connect("activate", lambda *_: self._sync_clock())
         self.add_action(self.clock_action)
+        for name, key in (("loop-view", "loop_view"), ("rtd-view", "rtd_view")):
+            act = Gio.SimpleAction.new_stateful(name, GLib.VariantType.new("s"),
+                                                GLib.Variant.new_string(getattr(self.settings, key)))
+            act.connect("change-state", self._on_view_changed, key)
+            self.add_action(act)
 
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -538,7 +545,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         # LCD
         if p is not None:
-            self.lcd.update(p, in_setup_menu=link.in_setup_menu, status=link.status_text)
+            if p.is_temperature and p.main_unit in ("°C", "°F"):
+                self.settings.rtd_unit = p.main_unit         # the Pt view follows the meter's temperature unit
+            view = view_for(p, self.settings.loop_view, self.settings.rtd_view, self.settings.rtd_unit)
+            self.lcd.update(p, in_setup_menu=link.in_setup_menu, status=link.status_text, view=view)
             self.temp_toggle.set_visible(p.sub_is_temperature)
             self._update_temp_toggle(p.sub_unit)
         else:
@@ -745,6 +755,27 @@ class MainWindow(Adw.ApplicationWindow):
     def _sync_clock(self) -> None:
         if self.link.is_connected:
             self.link.sync_clock(self.toast)
+
+    @staticmethod
+    def _views_menu() -> Gio.Menu:
+        """The open firmware's LP and Pt display views (SETUP pages 37 / 38), mirrored in the app's display."""
+        m = Gio.Menu()
+        for title, action, items in (
+                ("Current loop (DC mA)", "loop-view", (("Off", "off"), ("4–20 mA as %", "4-20"), ("0–20 mA as %", "0-20"))),
+                ("Platinum RTD (Ω)", "rtd-view", (("Off", "off"), ("PT100 temperature", "pt100"),
+                                                   ("PT1000 temperature", "pt1000")))):
+            sec = Gio.Menu()
+            for label, target in items:
+                item = Gio.MenuItem.new(label, None)
+                item.set_action_and_target_value(f"win.{action}", GLib.Variant.new_string(target))
+                sec.append_item(item)
+            m.append_section(title, sec)
+        return m
+
+    def _on_view_changed(self, action: Gio.SimpleAction, value: GLib.Variant, key: str) -> None:
+        action.set_state(value)
+        setattr(self.settings, key, value.get_string())
+        self.refresh()
 
     def toast(self, text: str) -> None:
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=3))

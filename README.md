@@ -27,6 +27,12 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
   local time, so SD-card log files get the right date. The meter confirms by echoing the frame. It takes one clock
   update each time its Bluetooth is switched on: to sync again, hold **PEAK** on the meter (Bluetooth off), hold it
   again (on) and sync.
+- **Meter Views** (main menu), for meters with zombu4's open firmware v0.9.6 or later: shows DC mA as percent of a
+  **4–20 mA / 0–20 mA loop** and Ω as the temperature of a **PT100 / PT1000** sensor, as the meter's SETUP pages
+  `LP` and `Pt` do. The Bluetooth frame doesn't say which view the meter shows, so set the same view here. The app
+  replays the firmware's own arithmetic on the same counts, so it shows the same digits as the meter's LCD. The PT
+  view uses the meter's temperature unit, learnt from its TEMP function. As on the meter, only the main reading
+  changes: the chart, the logs and the CSV keep mA / Ω.
 - Trend chart: Y axis follows the meter mode/range (or “Auto Y”), mouse-wheel zoom, drag to pan,
   double-click to reset, hover readout, dashed internal-temperature trace with show/hide toggle.
   It shows a rolling preview before logging starts and the full 25,000-sample window while logging.
@@ -104,9 +110,9 @@ python3 -m gw121 --demo   # simulated meter
 
 Works with EEVblog's original firmware **v2.05** and with
 [zombu4's open firmware](https://github.com/zombu4/121GW-Open-Firmware) (fast builds `F-0.9x`, and the bug-fix build
-`C-0.94` from [bigtimer-dev/121GW-Open-Firmware](https://github.com/bigtimer-dev/121GW-Open-Firmware)). The open
-firmware keeps the Bluetooth frame format, the key codes and the clock frame unchanged. Checked against `C-0.94`
-running in zombu4's emulator, with the app's own decoder and key frames:
+`C-0.96` from [bigtimer-dev/121GW-Open-Firmware](https://github.com/bigtimer-dev/121GW-Open-Firmware)). The open
+firmware keeps the Bluetooth frame format, the key codes and the clock frame unchanged. Checked against `C-0.94` and
+`C-0.96` (zombu4's v0.9.6 plus fixes) running in zombu4's emulator, with the app's own decoder and key frames:
 
 - every frame decoded at the default 2 readings/s and at the open firmware's fastest **20 readings/s** (SETUP page
   `bt`); the continuity beep is rate-limited, so the faster rate adds no beep storm
@@ -117,6 +123,13 @@ running in zombu4's emulator, with the app's own decoder and key frames:
   purpose, exactly as for the buttons on the meter
 - REL in percent and the dBm reference change only the meter's own display; the app shows the classic REL value
   and dBm
+- v0.9.6's 4–20 mA loop view (`LP`) and PT100 / PT1000 view (`Pt`) also change only the meter's display, and the
+  frame keeps mA / Ω. With **Meter Views** set the same way, the app shows the meter's digits (cross-checked against the
+  emulated meter's LCD across both loop spans, PT100 and PT1000, °C and °F, the ends of the span and `OFL`)
+- thermocouple types N, R and S (v0.9.6, SETUP page `tc`) arrive as normal temperatures; the chart scale extends
+  to 1800 °C / 3300 °F when an R or S reading goes above the type K span
+- v0.9.6's auto-hold at 0 Ω / 0 V (OHM, DIODE) only changes when v2.05's auto-hold captures a value; the app shows
+  it as `A-HOLD`, as before
 
 ## Files
 

@@ -27,6 +27,9 @@ DEFAULTS = {
     "cont_off_threshold": 400.0,
     "notifications": True,        # desktop notifications for lost link / low battery
     "show_temperature": True,
+    "loop_view": "off",           # open firmware LP view mirrored by the app: off / 4-20 / 0-20 (gw121/views.py)
+    "rtd_view": "off",            # open firmware Pt view: off / pt100 / pt1000
+    "rtd_unit": "°C",             # the meter's temperature unit, learnt from its TEMP readings
 }
 
 
@@ -39,6 +42,7 @@ class Settings:
         except (OSError, ValueError):
             pass
         self.normalize_thresholds()
+        self.normalize_views()
 
     def __getattr__(self, name: str):
         if name.startswith("_") or name not in DEFAULTS:
@@ -61,6 +65,12 @@ class Settings:
             tmp.replace(self.path)
         except OSError:
             pass
+
+    def normalize_views(self) -> None:
+        for key, allowed in (("loop_view", ("off", "4-20", "0-20")), ("rtd_view", ("off", "pt100", "pt1000")),
+                             ("rtd_unit", ("°C", "°F"))):
+            if self._data.get(key) not in allowed:
+                self._data[key] = DEFAULTS[key]
 
     def normalize_thresholds(self) -> None:
         on = self._data.get("cont_on_threshold", 25.0)

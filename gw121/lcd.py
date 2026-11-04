@@ -5,6 +5,7 @@ from __future__ import annotations
 from gi.repository import Gtk
 
 from .packet import Coupling, PacketV2
+from .views import ViewReading
 
 INK = (0x1F / 255, 0x24 / 255, 0x1F / 255)
 
@@ -213,7 +214,7 @@ class LcdView(Gtk.Box):
         self.status.set_label(status)
         self.add_css_class("dimmed")
 
-    def update(self, p: PacketV2, *, in_setup_menu: bool, status: str) -> None:
+    def update(self, p: PacketV2, *, in_setup_menu: bool, status: str, view: ViewReading | None = None) -> None:
         self.remove_css_class("dimmed")
         _set_on(self.i_bt, p.icon_bt)
         _set_on(self.i_auto, p.icon_auto)
@@ -231,13 +232,19 @@ class LcdView(Gtk.Box):
         _set_on(self.i_dbm, p.icon_dbm)
         _set_on(self.i_test, p.icon_test)
 
-        if p.is_main_negative and not p.is_main_overflow:
+        negative = view.negative if view else p.is_main_negative and not p.is_main_overflow
+        if negative:
             self.sign.remove_css_class("off")
         else:
             self.sign.add_css_class("off")
-        self.digits.set_label("  OL  " if p.is_main_overflow else p.formatted_main_value)
-        self.unit.set_label(p.main_unit)
-        self.mode_name.set_label(p.mode_name.upper())
+        if view:                                # the meter's LP / Pt view (gw121/views.py)
+            self.digits.set_label(view.text)
+            self.unit.set_label(view.unit)
+            self.mode_name.set_label(f"{p.mode_name.upper()} · {view.label}")
+        else:
+            self.digits.set_label("  OL  " if p.is_main_overflow else p.formatted_main_value)
+            self.unit.set_label(p.main_unit)
+            self.mode_name.set_label(p.mode_name.upper())
 
         c = p.coupling
         _set_on(self.t_dc, c == Coupling.DC)
