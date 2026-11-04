@@ -12,6 +12,7 @@ from gi.repository import GLib
 
 from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
 from .packet import FrameAssembler, PacketV2
+from .setup_pages import SetupText, parse_setup_frames
 from .upload import AnswerParser, UploadSession
 
 COMM_TIMEOUT = 5.0
@@ -65,6 +66,9 @@ class MeterLink:
         self.firmware_version: str | None = None    # open firmware v1.0.1+ answers the version request
         self._version_tail = bytearray()
         self._version_asks = 0
+        self.setup_text: SetupText | None = None    # custom firmware C-1.03+: the SETUP page shown (frame F7)
+        self._setup_buf = bytearray()
+        self._setup_at = 0.0
         self.upload_mode = False        # the upload dialog is open: the meter's page Ld sends no reading frames
         self._upload: UploadSession | None = None
         self._upload_parser = AnswerParser()
@@ -143,6 +147,7 @@ class MeterLink:
             self._match_clock_echo(data)
         if self.firmware_version is None and self._version_asks:
             self._match_version(data)
+        self._match_setup(data)
         packets = self._assembler.feed(data)
         if packets:
             self._publish(packets[-1])
@@ -163,6 +168,26 @@ class MeterLink:
         for fn in list(self._packet_listeners):
             fn(pkt)
         self.changed()
+
+    SETUP_TEXT_TIMEOUT = 4.5            # the meter repeats the frame at least every 2 s while a page is shown
+
+    def _match_setup(self, data: bytes) -> None:
+        buf = self._setup_buf
+        buf += data
+        frames, done = parse_setup_frames(bytes(buf))
+        del buf[:done]
+        if len(buf) > 32:
+            del buf[:-11]
+        if frames:
+            f = frames[-1]
+            new = None if f.item == 0 else f
+            self._setup_at = time.monotonic()
+            if new != self.setup_text:
+                self.setup_text = new
+                self.changed()
+        elif self.setup_text is not None and time.monotonic() - self._setup_at > self.SETUP_TEXT_TIMEOUT:
+            self.setup_text = None
+            self.changed()
 
     def _match_version(self, data: bytes) -> None:
         tail = self._version_tail
@@ -187,6 +212,8 @@ class MeterLink:
         self.firmware_version = None
         self._version_tail.clear()
         self._version_asks = 0
+        self.setup_text = None
+        self._setup_buf.clear()
         self._upload_finish(False, "Upload stopped: disconnected")
 
     def note_key(self, key: MeterKey) -> None:

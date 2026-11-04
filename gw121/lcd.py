@@ -214,7 +214,8 @@ class LcdView(Gtk.Box):
         self.status.set_label(status)
         self.add_css_class("dimmed")
 
-    def update(self, p: PacketV2, *, in_setup_menu: bool, status: str, view: ViewReading | None = None) -> None:
+    def update(self, p: PacketV2, *, in_setup_menu: bool, status: str, view: ViewReading | None = None,
+               setup=None) -> None:
         self.remove_css_class("dimmed")
         _set_on(self.i_bt, p.icon_bt)
         _set_on(self.i_auto, p.icon_auto)
@@ -255,7 +256,10 @@ class LcdView(Gtk.Box):
         self.bar.update(p)
 
         desc = p.setup_descriptor() if in_setup_menu else None
-        if desc is not None:
+        if setup is not None:                   # custom firmware: the page and its text (gw121/setup_pages.py)
+            self.sub_title.set_label("SETUP · " + setup.name + (" · editing" if setup.editing else ""))
+            self.sub_reading.set_label(setup.value)
+        elif desc is not None:
             self.sub_title.set_label("SETUP · " + desc.title)
             self.sub_reading.set_label(desc.reading)
         else:

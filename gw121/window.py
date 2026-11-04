@@ -200,6 +200,17 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.lcd = LcdView()
         box.append(self.lcd)
+        # SETUP page explanation (custom firmware C-1.03+, frame F7)
+        self.setup_row = Adw.ActionRow(title="", subtitle="", subtitle_lines=4)
+        self.setup_row.add_prefix(Gtk.Image(icon_name="preferences-system-symbolic"))
+        self.setup_meter = Gtk.Label(valign=Gtk.Align.CENTER)
+        self.setup_meter.add_css_class("monospace")
+        self.setup_row.add_suffix(self.setup_meter)
+        setup_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        setup_list.add_css_class("boxed-list")
+        setup_list.append(self.setup_row)
+        self.setup_box = setup_list
+        box.append(setup_list)
 
         # meter controls
         ctl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -553,11 +564,19 @@ class MainWindow(Adw.ApplicationWindow):
             if p.is_temperature and p.main_unit in ("°C", "°F"):
                 self.settings.rtd_unit = p.main_unit         # the Pt view follows the meter's temperature unit
             view = view_for(p, self.settings.loop_view, self.settings.rtd_view, self.settings.rtd_unit)
-            self.lcd.update(p, in_setup_menu=link.in_setup_menu, status=link.status_text, view=view)
+            self.lcd.update(p, in_setup_menu=link.in_setup_menu, status=link.status_text, view=view,
+                            setup=link.setup_text)
             self.temp_toggle.set_visible(p.sub_is_temperature)
             self._update_temp_toggle(p.sub_unit)
         else:
             self.lcd.clear(link.status_text)
+        st = link.setup_text
+        self.setup_box.set_visible(st is not None)
+        if st is not None:
+            self.setup_row.set_title(GLib.markup_escape_text(f"SETUP · {st.name}: {st.value}"
+                                                             + ("  (editing)" if st.editing else "")))
+            self.setup_row.set_subtitle(GLib.markup_escape_text(st.description))
+            self.setup_meter.set_label(f"“{st.shown}”")
         self.clock_action.set_enabled(link.is_connected and not link.uploading)
         self.upload_action.set_enabled(link.is_connected or link.uploading)
         for b in self.key_buttons:

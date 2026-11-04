@@ -31,6 +31,11 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 - **Firmware version**: on connect the app asks the meter for its firmware version (open firmware v1.0.1 and later
   answer, e.g. `C-1.02`) and shows it next to the meter on the Connect row. v2.05 and older open firmware ignore the
   request; nothing changes on the meter.
+- **SETUP pages explained** (custom firmware `C-1.03` and later): while you step through the meter's SETUP pages,
+  the app shows each page's name, its present setting in words (for example *Bluetooth rate: 20*, *4–20 mA loop view:
+  4–20 mA as %*, *Low limit: 9.0000 V*) and what the page does, plus the meter's own text. It also marks the page while
+  you're changing it. With older firmware most pages arrive as zeros, so the app can show only the pages EEVblog's
+  v2.05 described.
 - **Upload Firmware…** (main menu), for zombu4's open firmware v1.0.0 or later (`C-1.02` included): sends a firmware
   file (`EEVBlog.bin`) over Bluetooth to the meter's SD card, so updating no longer needs the card in a computer.
   1. On the meter, turn Bluetooth on (hold PEAK), turn logging off and put the SD card in.
@@ -173,6 +178,10 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
 - Version request (open firmware v1.0.1+): `F4 39 30 39 30`; the meter echoes it and answers `F6` + five ASCII
   characters (`C-102`, shown as `C-1.02`) and an XOR byte that makes the XOR of all seven bytes zero
   (`gw121/keys.py` `parse_version_answer`).
+- SETUP page text (custom firmware `C-1.03`+, `CF-07`): while a SETUP page is shown the meter also sends
+  `F7 item c0..c4 flags units 00 xor` (11 bytes): the page number, the five characters of the small display, the
+  decimal point (flags bits 0..2), minus (bit 4), editing (bit 5), unit icons (V, A, m, k, Hz, dB, Ω) and an XOR byte
+  that makes the XOR of all eleven bytes zero; item 0 once when the page is left (`gw121/setup_pages.py`).
 - Firmware upload (open firmware v1.0.0+, page `Ld`, firmware `ble/bft.s`): packets `B5 5B type seq(2) len payload
   crc16(2)` (type 1 START with size and CRC-32, 2 DATA, 3 END, 4 ABORT; CRC-16/CCITT-FALSE), each answered
   `B5 5B 81 seq(2) 03 status next(2) crc16(2)` (`gw121/upload.py`).
