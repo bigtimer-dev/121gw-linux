@@ -566,8 +566,10 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             title, icon = "Disconnected", "bluetooth-disabled-symbolic"
         self.conn_row.set_title(GLib.markup_escape_text(title))
-        self.conn_row.set_subtitle(GLib.markup_escape_text(
-            f"{link.status_text} · {link.packets_received} packets" if link.packets_received else link.status_text))
+        sub = f"{link.status_text} · {link.packets_received} packets" if link.packets_received else link.status_text
+        if link.firmware_version:
+            sub += f" · firmware {link.firmware_version}"
+        self.conn_row.set_subtitle(GLib.markup_escape_text(sub))
         self.conn_icon.set_from_icon_name(icon)
         self.power_row.set_visible(link.adapter_off)
         if self.auto_row.get_active() != link.settings.auto_reconnect:

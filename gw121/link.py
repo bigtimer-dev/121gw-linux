@@ -10,7 +10,7 @@ from typing import Callable
 
 from gi.repository import GLib
 
-from .keys import MeterKey, clock_payload
+from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
 from .packet import FrameAssembler, PacketV2
 
 COMM_TIMEOUT = 5.0
@@ -61,6 +61,9 @@ class MeterLink:
         self._clock_timer = 0
         self._clock_repeat = False
         self._clock_synced = False      # a clock frame was echoed on this connection
+        self.firmware_version: str | None = None    # open firmware v1.0.1+ answers the version request
+        self._version_tail = bytearray()
+        self._version_asks = 0
 
     # ---- observers ---------------------------------------------------------
 
@@ -125,6 +128,8 @@ class MeterLink:
     def ingest(self, data: bytes) -> None:
         if self._clock_frame is not None:
             self._match_clock_echo(data)
+        if self.firmware_version is None and self._version_asks:
+            self._match_version(data)
         packets = self._assembler.feed(data)
         if packets:
             self._publish(packets[-1])
@@ -139,9 +144,23 @@ class MeterLink:
         elif pkt.sub_mode_raw == 140:
             n = abs(pkt.sub_int_value)
             self.meter_time = f"{min(23, (n >> 8) & 0xFF):02d}:{min(59, n & 0xFF):02d}"
+        if self.firmware_version is None and self.packets_received in (2, 12) and self._version_asks < 2:
+            self._version_asks += 1                 # ask once the link streams; once more if the answer was lost
+            self.write_frame(VERSION_REQUEST, None)
         for fn in list(self._packet_listeners):
             fn(pkt)
         self.changed()
+
+    def _match_version(self, data: bytes) -> None:
+        tail = self._version_tail
+        tail += data
+        v = parse_version_answer(bytes(tail))
+        if v:
+            self.firmware_version = v
+            tail.clear()
+            self.changed()
+        elif len(tail) > 64:
+            del tail[:-6]
 
     def _reset_link_state(self) -> None:
         self._stop_watchdog()
@@ -152,6 +171,9 @@ class MeterLink:
         self._last_packet_at = None
         self._clock_finish("Clock update cancelled: disconnected")
         self._clock_synced = False
+        self.firmware_version = None
+        self._version_tail.clear()
+        self._version_asks = 0
 
     def note_key(self, key: MeterKey) -> None:
         """Track whether the meter is in its SETUP menu (REL/PEAK act as arrows there)."""
@@ -177,7 +199,7 @@ class MeterLink:
         self._clock_frame = clock_payload(when)
         self._clock_when = when
         self._clock_cb = on_result
-        self._clock_repeat = self._clock_synced
+        self._clock_repeat = self._clock_synced and not clock_applies_every_time(self.firmware_version)
         self._clock_tail.clear()
         self._clock_timer = GLib.timeout_add(CLOCK_REPLY_MS, self._clock_timed_out)
         self.write_frame(self._clock_frame, self._clock_written)

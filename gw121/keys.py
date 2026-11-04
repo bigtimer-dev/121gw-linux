@@ -31,6 +31,36 @@ class MeterKey(Enum):
         return bytes([0xF4, kind, self.code, kind, self.code])
 
 
+# Firmware version request of zombu4's open firmware v1.0.1+ (IMP-30): a key frame with the unused code 0x90, echoed like
+# any key frame and answered with F6 + the five characters of the power-on version + XOR. v2.05 ignores the code.
+VERSION_REQUEST = bytes([0xF4, 0x39, 0x30, 0x39, 0x30])
+
+
+def parse_version_answer(buf: bytes) -> str | None:
+    """The version ("F-1.02", "C-1.02") from the first valid F6 answer in buf, else None."""
+    for i in range(len(buf) - 6):
+        f = buf[i:i + 7]
+        if f[0] != 0xF6:
+            continue
+        x = 0
+        for b in f:
+            x ^= b
+        c = f[1:6]
+        if x == 0 and chr(c[1]) == "-" and chr(c[0]).isalpha() and all(chr(d).isdigit() for d in c[2:]):
+            return f"{chr(c[0])}-{chr(c[2])}.{chr(c[3])}{chr(c[4])}"
+    return None
+
+
+def clock_applies_every_time(version: str | None) -> bool:
+    """Open firmware v1.0.1 and later (IMP-31) apply every set-clock frame; v2.05 only the first per Bluetooth-on."""
+    if not version or version[0] not in "FC":
+        return False
+    try:
+        return float(version[2:]) >= 1.01
+    except ValueError:
+        return False
+
+
 # Layout of the on-screen key pad, matching the meter / iOS app.
 KEYPAD = [
     MeterKey.HOLD, MeterKey.MODE, MeterKey.REL, MeterKey.RANGE,

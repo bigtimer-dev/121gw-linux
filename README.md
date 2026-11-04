@@ -24,9 +24,13 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 - Remote keys HOLD / MODE / REL▲ / RANGE / MIN-MAX / MEM / PEAK▼ / SETUP with short and long press
   (MODE long ≈ backlight); REL / PEAK act as ▲ / ▼ in the SETUP menu
 - **Sync Meter Clock** (button under the keys, main menu or `Ctrl+T`): sets the meter's clock to the computer's
-  local time, so SD-card log files get the right date. The meter confirms by echoing the frame. It takes one clock
-  update each time its Bluetooth is switched on: to sync again, hold **PEAK** on the meter (Bluetooth off), hold it
-  again (on) and sync.
+  local time, so SD-card log files get the right date. The meter confirms by echoing the frame. Open firmware
+  `F-1.01` / `C-1.02` and later take every clock frame, so you can sync again at any time. v2.05 and older open
+  firmware take one clock update each time Bluetooth is switched on: to sync again, hold **PEAK** on the meter
+  (Bluetooth off), hold it again (on) and sync.
+- **Firmware version**: on connect the app asks the meter for its firmware version (open firmware v1.0.1 and later
+  answer, e.g. `C-1.02`) and shows it next to the meter on the Connect row. v2.05 and older open firmware ignore the
+  request; nothing changes on the meter.
 - **Meter Views** (main menu), for meters with zombu4's open firmware v0.9.6 or later: shows DC mA as percent of a
   **4–20 mA / 0–20 mA loop** and Ω as the temperature of a **PT100 / PT1000** sensor, as the meter's SETUP pages
   `LP` and `Pt` do. The Bluetooth frame doesn't say which view the meter shows, so set the same view here. The app
@@ -109,10 +113,10 @@ python3 -m gw121 --demo   # simulated meter
 ## Meter firmware
 
 Works with EEVblog's original firmware **v2.05** and with
-[zombu4's open firmware](https://github.com/zombu4/121GW-Open-Firmware) (fast builds `F-0.9x`, and the bug-fix build
-`C-0.96` from [bigtimer-dev/121GW-Open-Firmware](https://github.com/bigtimer-dev/121GW-Open-Firmware)). The open
-firmware keeps the Bluetooth frame format, the key codes and the clock frame unchanged. Checked against `C-0.94` and
-`C-0.96` (zombu4's v0.9.6 plus fixes) running in zombu4's emulator, with the app's own decoder and key frames:
+[zombu4's open firmware](https://github.com/zombu4/121GW-Open-Firmware) (fast builds `F-0.9x` / `F-1.0x`, and the bug-fix
+builds `C-0.96` / `C-1.02` from [bigtimer-dev/121GW-Open-Firmware](https://github.com/bigtimer-dev/121GW-Open-Firmware)). The open
+firmware keeps the Bluetooth frame format, the key codes and the clock frame unchanged. Checked against `C-0.94`,
+`C-0.96` and `C-1.02` (zombu4's v1.0.2 plus fixes) running in zombu4's emulator, with the app's own decoder and key frames:
 
 - every frame decoded at the default 2 readings/s and at the open firmware's fastest **20 readings/s** (SETUP page
   `bt`); the continuity beep is rate-limited, so the faster rate adds no beep storm
@@ -130,6 +134,9 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
   to 1800 °C / 3300 °F when an R or S reading goes above the type K span
 - v0.9.6's auto-hold at 0 Ω / 0 V (OHM, DIODE) only changes when v2.05's auto-hold captures a value; the app shows
   it as `A-HOLD`, as before
+- v1.0.1's version request: `C-1.02` answers with its version, which the app shows; `C-0.96` only echoes the request,
+  with mode, SETUP page, HOLD and REL unchanged
+- v1.0.2's Bluetooth file upload (SETUP page `Ld`) is not used by the app; it changes nothing for the reading frames
 
 ## Files
 
@@ -146,8 +153,12 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
 - Keys: `F4 k c k c`, `k = 0x30` short / `0x38` long, `c = 0x31…0x38` (RANGE, HOLD, REL, PEAK, MODE,
   MIN/MAX, MEM, SETUP)
 - Clock: `F8` + year − 2000, month, day, hour, minute, second and their XOR, each as two upper-case ASCII hex
-  digits (15 bytes, `gw121/keys.py` `clock_payload`). The meter echoes the frame and applies the first valid one
-  after power-on or after its Bluetooth is switched on.
+  digits (15 bytes, `gw121/keys.py` `clock_payload`). The meter echoes the frame. v2.05 applies the first valid one
+  after power-on or after its Bluetooth is switched on; open firmware v1.0.1 and later apply every one (`C-1.02`
+  refuses dates and times outside the calendar: no echo).
+- Version request (open firmware v1.0.1+): `F4 39 30 39 30`; the meter echoes it and answers `F6` + five ASCII
+  characters (`C-102`, shown as `C-1.02`) and an XOR byte that makes the XOR of all seven bytes zero
+  (`gw121/keys.py` `parse_version_answer`).
 
 ## Development
 

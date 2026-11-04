@@ -14,7 +14,7 @@ from typing import Callable
 
 from gi.repository import GLib
 
-from .keys import MeterKey
+from .keys import VERSION_REQUEST, MeterKey
 from .link import DiscoveredDevice, MeterLink
 from .packet import RANGES, MeterMode, build_frame
 
@@ -162,6 +162,12 @@ class DemoLink(MeterLink):
                 when = time.mktime((2000 + v[0], v[1], v[2], v[3], v[4], v[5], 0, 0, -1))
                 self._clock_offset = when - time.time()
                 GLib.timeout_add(150, self._echo, bytes(payload))     # the meter echoes the frame
+        elif payload == VERSION_REQUEST:                              # as open firmware v1.0.2 (IMP-30)
+            answer = bytes([0xF6]) + b"F-102"
+            x = 0
+            for b in answer:
+                x ^= b
+            GLib.timeout_add(100, self._echo, bytes(payload) + answer + bytes([x]))
         if done:
             done(None)
 
