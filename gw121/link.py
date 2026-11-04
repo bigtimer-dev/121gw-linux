@@ -12,6 +12,7 @@ from gi.repository import GLib
 
 from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
 from .packet import FrameAssembler, PacketV2
+from .upload import AnswerParser, UploadSession
 
 COMM_TIMEOUT = 5.0
 BATTERY_LOW_V = 4.5
@@ -64,6 +65,13 @@ class MeterLink:
         self.firmware_version: str | None = None    # open firmware v1.0.1+ answers the version request
         self._version_tail = bytearray()
         self._version_asks = 0
+        self.upload_mode = False        # the upload dialog is open: the meter's page Ld sends no reading frames
+        self._upload: UploadSession | None = None
+        self._upload_parser = AnswerParser()
+        self._upload_timer = 0
+        self._upload_t0 = 0.0
+        self._upload_progress: Callable[[float, int, int, float], None] | None = None
+        self._upload_done: Callable[[bool, str], None] | None = None
 
     # ---- observers ---------------------------------------------------------
 
@@ -118,6 +126,8 @@ class MeterLink:
     def _watchdog_tick(self) -> bool:
         if not self.is_connected:
             lost = True
+        elif self.upload_mode:
+            lost = False                # page Ld: no reading frames by design
         else:
             lost = self._last_packet_at is not None and time.monotonic() - self._last_packet_at > COMM_TIMEOUT
         if lost != self.communication_lost:
@@ -126,6 +136,9 @@ class MeterLink:
         return GLib.SOURCE_CONTINUE
 
     def ingest(self, data: bytes) -> None:
+        if self._upload is not None:
+            for a in self._upload_parser.feed(data):
+                self._upload_answer(*a)
         if self._clock_frame is not None:
             self._match_clock_echo(data)
         if self.firmware_version is None and self._version_asks:
@@ -174,6 +187,7 @@ class MeterLink:
         self.firmware_version = None
         self._version_tail.clear()
         self._version_asks = 0
+        self._upload_finish(False, "Upload stopped: disconnected")
 
     def note_key(self, key: MeterKey) -> None:
         """Track whether the meter is in its SETUP menu (REL/PEAK act as arrows there)."""
@@ -237,6 +251,84 @@ class MeterLink:
         self._clock_tail.clear()
         if cb is not None and text:
             cb(text)
+
+    # ---- firmware upload (open firmware v1.0.0+, SETUP page Ld) ------------
+
+    @property
+    def uploading(self) -> bool:
+        return self._upload is not None
+
+    def upload_firmware(self, data: bytes, on_progress: Callable[[float, int, int, float], None],
+                        on_done: Callable[[bool, str], None]) -> None:
+        """Send a firmware file to the meter's SD card; on_progress(fraction, sent, total, bytes/s), on_done(ok, text)."""
+        if not self.is_connected:
+            on_done(False, "Not connected")
+            return
+        self.cancel_upload()
+        self._upload = UploadSession(data)
+        self._upload_parser.clear()
+        self._upload_progress, self._upload_done = on_progress, on_done
+        self._upload_t0 = time.monotonic()
+        self._upload_send()
+
+    def cancel_upload(self) -> None:
+        if self._upload is not None:
+            abort = self._upload.abort_packet()
+            self._upload_finish(False, "Upload cancelled")
+            self.write_frame(abort, None)           # the meter goes back to waiting (Ld-bt)
+
+    def _upload_send(self) -> None:
+        up = self._upload
+        if up is None:
+            return
+        step = up.step()
+        self._upload_stop_timer()
+        self._upload_timer = GLib.timeout_add(step.timeout_ms, self._upload_timed_out)
+        self.write_frame(step.packet, self._upload_written)
+
+    def _upload_written(self, error: str | None) -> None:
+        if error and self._upload is not None:
+            self._upload_finish(False, f"Bluetooth write failed: {error}")
+
+    def _upload_answer(self, seq: int, status: int, nxt: int) -> None:
+        up = self._upload
+        if up is None:
+            return
+        advanced = up.answer(seq, status, nxt)
+        if up.done:
+            self._upload_finish(up.ok, up.message)
+        elif advanced:
+            if self._upload_progress:
+                elapsed = max(time.monotonic() - self._upload_t0, 1e-6)
+                self._upload_progress(up.fraction, up.sent_bytes, len(up.data), up.sent_bytes / elapsed)
+            self._upload_send()
+
+    def _upload_timed_out(self) -> bool:
+        self._upload_timer = 0
+        up = self._upload
+        if up is not None:
+            if up.timeout():
+                self._upload_send()
+            else:
+                self._upload_finish(False, up.message)
+        return GLib.SOURCE_REMOVE
+
+    def _upload_stop_timer(self) -> None:
+        if self._upload_timer:
+            GLib.source_remove(self._upload_timer)
+            self._upload_timer = 0
+
+    def _upload_finish(self, ok: bool, text: str) -> None:
+        self._upload_stop_timer()
+        if self._upload is None:
+            return
+        cb = self._upload_done
+        self._upload = None
+        self._upload_progress = self._upload_done = None
+        self._upload_parser.clear()
+        if cb is not None:
+            cb(ok, text)
+        self.changed()
 
     # ---- transport API (overridden) ----------------------------------------
 

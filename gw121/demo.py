@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import math
 import random
+import struct
 import time
+import zlib
 from dataclasses import dataclass
 from typing import Callable
 
 from gi.repository import GLib
 
 from .keys import VERSION_REQUEST, MeterKey
+from . import upload as _up
 from .link import DiscoveredDevice, MeterLink
 from .packet import RANGES, MeterMode, build_frame
 
@@ -84,6 +87,7 @@ class DemoLink(MeterLink):
         self._minmax_vals: list[float] = []
         # meter clock, unset like a fresh 121GW until the app syncs it
         self._clock_offset = time.mktime((2004, 1, 1, 0, 0, 0, 0, 0, -1)) - time.time()
+        self._receiver = DemoSdReceiver()
 
     def start(self) -> None:
         self.devices[DEMO_ADDRESS] = DiscoveredDevice(DEMO_ADDRESS, "121GW (demo)", rssi=-58)
@@ -162,6 +166,10 @@ class DemoLink(MeterLink):
                 when = time.mktime((2000 + v[0], v[1], v[2], v[3], v[4], v[5], 0, 0, -1))
                 self._clock_offset = when - time.time()
                 GLib.timeout_add(150, self._echo, bytes(payload))     # the meter echoes the frame
+        elif payload[:2] == b"\xB5\x5B":                                 # page Ld (IMP-28), see DemoSdReceiver
+            answer = self._receiver.packet(bytes(payload))
+            if answer:
+                GLib.timeout_add(15, self._echo, answer)
         elif payload == VERSION_REQUEST:                              # as open firmware v1.0.2 (IMP-30)
             answer = bytes([0xF6]) + b"F-102"
             x = 0
@@ -293,3 +301,59 @@ class DemoLink(MeterLink):
             bar_flags=bar_flags, bar_value=bar,
             icon1=icon1, icon2=icon2, icon3=icon3,
         )
+
+
+class DemoSdReceiver:
+    """The meter's side of the Bluetooth file transfer (ble/bft.s), enough for the demo: the file is kept in memory."""
+
+    def __init__(self) -> None:
+        self.size = self.crc = 0
+        self.data = bytearray()
+        self.expect = 0
+        self.receiving = False
+        self.card: bytes | None = None          # "EEVBlog.bin" after a checked transfer
+
+    @staticmethod
+    def _answer(seq: int, status: int, nxt: int) -> bytes:
+        body = struct.pack("<BHBBH", 0x81, seq & 0xFFFF, 3, status, nxt & 0xFFFF)
+        return b"\xB5\x5B" + body + struct.pack("<H", _up.crc16(body))
+
+    def packet(self, p: bytes) -> bytes | None:
+        if len(p) < 8 or len(p) != 8 + p[5]:
+            return None
+        body, (crc,) = p[2:-2], struct.unpack("<H", p[-2:])
+        ptype, seq, n = struct.unpack_from("<BHB", body)
+        payload = body[4:]
+        if crc != _up.crc16(body):
+            return self._answer(seq, 1, self.expect)
+        if ptype == _up.T_START:
+            self.size, self.crc = struct.unpack("<II", payload)
+            if not _up.MIN_SIZE <= self.size <= _up.MAX_SIZE:
+                return self._answer(seq, 4, 0)
+            self.data.clear()
+            self.expect, self.receiving = 0, True
+            return self._answer(seq, 0, 0)
+        if ptype == _up.T_ABORT:
+            self.receiving = False
+            return self._answer(seq, 0, 0)
+        if not self.receiving:
+            return self._answer(seq, 3, 0)
+        if ptype == _up.T_DATA:
+            if seq == self.expect - 1:
+                return self._answer(seq, 0, self.expect)            # sent twice: accepted, not stored again
+            if seq != self.expect:
+                return self._answer(seq, 2, self.expect)
+            if len(self.data) + len(payload) > self.size:
+                return self._answer(seq, 5, self.expect)
+            self.data += payload
+            self.expect += 1
+            return self._answer(seq, 0, self.expect)
+        if ptype == _up.T_END:
+            self.receiving = False
+            if len(self.data) != self.size or zlib.crc32(self.data) & 0xFFFFFFFF != self.crc:
+                return self._answer(seq, 0x12, 0)
+            if _up.check_image(bytes(self.data)):
+                return self._answer(seq, 0x13, 0)
+            self.card = bytes(self.data)
+            return self._answer(seq, 0, 0)
+        return self._answer(seq, 3, 0)

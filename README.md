@@ -31,6 +31,18 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 - **Firmware version**: on connect the app asks the meter for its firmware version (open firmware v1.0.1 and later
   answer, e.g. `C-1.02`) and shows it next to the meter on the Connect row. v2.05 and older open firmware ignore the
   request; nothing changes on the meter.
+- **Upload Firmware…** (main menu), for zombu4's open firmware v1.0.0 or later (`C-1.02` included): sends a firmware
+  file (`EEVBlog.bin`) over Bluetooth to the meter's SD card, so updating no longer needs the card in a computer.
+  1. On the meter, turn Bluetooth on (hold PEAK), turn logging off and put the SD card in.
+  2. Go to SETUP page `Ld` (after `bt`); the meter shows `Ld-bt` and stops sending readings while that page is shown.
+  3. In the app, choose the file and press Upload. The app checks the file first (size, a valid 121GW image, and
+     the version it contains). The meter shows `Ld nn` (percent), then `Ld oK` when `EEVBlog.bin` is written and
+     read back.
+  4. To install it, use the usual key sequence: meter off, hold **MEM + HOLD** while switching on, press **SETUP**.
+
+  The meter writes to a temporary file and replaces `EEVBlog.bin` only after the length and CRC-32 match, so a
+  cancelled or broken upload leaves the card as it was. The upload takes a few minutes (stop and wait, one 232-byte
+  packet per answer).
 - **Meter Views** (main menu), for meters with zombu4's open firmware v0.9.6 or later: shows DC mA as percent of a
   **4–20 mA / 0–20 mA loop** and Ω as the temperature of a **PT100 / PT1000** sensor, as the meter's SETUP pages
   `LP` and `Pt` do. The Bluetooth frame doesn't say which view the meter shows, so set the same view here. The app
@@ -136,7 +148,9 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
   it as `A-HOLD`, as before
 - v1.0.1's version request: `C-1.02` answers with its version, which the app shows; `C-0.96` only echoes the request,
   with mode, SETUP page, HOLD and REL unchanged
-- v1.0.2's Bluetooth file upload (SETUP page `Ld`) is not used by the app; it changes nothing for the reading frames
+- the Bluetooth firmware upload (SETUP page `Ld`): the app's sender (`gw121/upload.py`) sent the whole `C-1.02` image,
+  including one damaged and one lost packet, to an emulated `C-1.02`; the emulated card then held an identical
+  `EEVBlog.bin`
 
 ## Files
 
@@ -159,6 +173,9 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
 - Version request (open firmware v1.0.1+): `F4 39 30 39 30`; the meter echoes it and answers `F6` + five ASCII
   characters (`C-102`, shown as `C-1.02`) and an XOR byte that makes the XOR of all seven bytes zero
   (`gw121/keys.py` `parse_version_answer`).
+- Firmware upload (open firmware v1.0.0+, page `Ld`, firmware `ble/bft.s`): packets `B5 5B type seq(2) len payload
+  crc16(2)` (type 1 START with size and CRC-32, 2 DATA, 3 END, 4 ABORT; CRC-16/CCITT-FALSE), each answered
+  `B5 5B 81 seq(2) 03 status next(2) crc16(2)` (`gw121/upload.py`).
 
 ## Development
 

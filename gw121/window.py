@@ -15,6 +15,7 @@ from .link import MeterLink
 from .packet import PacketV2
 from .sessions import LIVE_WINDOW, DataPoint, Session, SessionStore, default_session_name
 from .settings import Settings
+from .upload import check_image, image_version
 from .views import view_for
 
 PREVIEW_POINTS = 600
@@ -122,6 +123,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append("Sync Meter Clock", "win.sync-clock")
         menu.append_submenu("Meter Views", self._views_menu())
+        menu.append("Upload Firmware…", "win.upload-firmware")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("About 121GW", "app.about")
         menu.append("Quit", "app.quit")
@@ -139,6 +141,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.clock_action = Gio.SimpleAction.new("sync-clock", None)
         self.clock_action.connect("activate", lambda *_: self._sync_clock())
         self.add_action(self.clock_action)
+        self.upload_action = Gio.SimpleAction.new("upload-firmware", None)
+        self.upload_action.connect("activate", lambda *_: UploadDialog(self).present(self))
+        self.add_action(self.upload_action)
         for name, key in (("loop-view", "loop_view"), ("rtd-view", "rtd_view")):
             act = Gio.SimpleAction.new_stateful(name, GLib.VariantType.new("s"),
                                                 GLib.Variant.new_string(getattr(self.settings, key)))
@@ -553,7 +558,8 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_temp_toggle(p.sub_unit)
         else:
             self.lcd.clear(link.status_text)
-        self.clock_action.set_enabled(link.is_connected)
+        self.clock_action.set_enabled(link.is_connected and not link.uploading)
+        self.upload_action.set_enabled(link.is_connected or link.uploading)
         for b in self.key_buttons:
             b.set_sensitive(link.is_connected)
             b.set_setup_mode(link.in_setup_menu)
@@ -984,3 +990,167 @@ class SessionDialog(Adw.Dialog):
             self.toasts.add_toast(toast)
 
         fd.save(self.win, None, done)
+
+
+class UploadDialog(Adw.Dialog):
+    """Send a firmware file to the meter's SD card over Bluetooth (open firmware v1.0.0+, SETUP page Ld)."""
+
+    def __init__(self, win: MainWindow):
+        super().__init__(title="Upload Firmware", content_width=520)
+        self.win = win
+        self.link = win.link
+        self.data: bytes | None = None
+        self.link.upload_mode = True            # page Ld sends no readings: no "communication lost" meanwhile
+        self.connect("closed", self._closed)
+        self.connect("close-attempt", self._close_attempt)
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+
+        steps = Adw.PreferencesGroup(
+            title="On the meter",
+            description=("Needs zombu4's open firmware v1.0.0 or later (C-1.02 included).\n"
+                         "1. Bluetooth on (hold PEAK), logging off, SD card in.\n"
+                         "2. SETUP, then REL / PEAK to the page Ld (after bt): the meter shows Ld-bt. "
+                         "It stops sending readings while that page is shown.\n"
+                         "3. Choose the file here and press Upload; the meter shows Ld nn (percent), then Ld oK.\n"
+                         "4. Install: switch the meter off, hold MEM + HOLD while switching it on, press SETUP. "
+                         "The upload alone does not change the installed firmware."))
+        page.add(steps)
+
+        g = Adw.PreferencesGroup(title="Firmware file")
+        self.file_row = Adw.ActionRow(title="No file chosen", subtitle="EEVBlog.bin", subtitle_lines=3)
+        choose = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
+        choose.connect("clicked", self._choose)
+        self.file_row.add_suffix(choose)
+        self.choose_btn = choose
+        g.add(self.file_row)
+        meter = self.link.firmware_version or "unknown (v2.05 and open firmware before v1.0.1 do not say)"
+        g.add(Adw.ActionRow(title="Meter firmware now", subtitle=meter))
+        page.add(g)
+
+        pg = Adw.PreferencesGroup()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.progress = Gtk.ProgressBar(show_text=True, text="")
+        self.status = Gtk.Label(wrap=True, xalign=0, label="")
+        self.status.add_css_class("dim-label")
+        box.append(self.progress)
+        box.append(self.status)
+        pg.add(_card(box))
+        page.add(pg)
+
+        bg = Adw.PreferencesGroup()
+        btns = Gtk.Box(spacing=12, halign=Gtk.Align.END)
+        self.cancel_btn = Gtk.Button(label="Cancel Upload", sensitive=False)
+        self.cancel_btn.connect("clicked", lambda *_: self.link.cancel_upload())
+        self.upload_btn = Gtk.Button(label="Upload", sensitive=False)
+        self.upload_btn.add_css_class("suggested-action")
+        self.upload_btn.connect("clicked", self._start)
+        btns.append(self.cancel_btn)
+        btns.append(self.upload_btn)
+        bg.add(btns)
+        page.add(bg)
+
+        tv.set_content(page)
+        self.set_child(tv)
+
+    def _choose(self, *_):
+        fd = Gtk.FileDialog(title="Choose Firmware", modal=True)
+        f = Gtk.FileFilter()
+        f.set_name("Firmware image (*.bin)")
+        f.add_pattern("*.bin")
+        f.add_pattern("*.BIN")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(f)
+        fd.set_filters(filters)
+        fd.open(self.win, None, self._chosen)
+
+    def _chosen(self, fd, res):
+        try:
+            gfile = fd.open_finish(res)
+        except GLib.Error:
+            return
+        try:
+            data = gfile.load_bytes(None)[0].get_data()
+        except GLib.Error as e:
+            self._set_file(None, gfile.get_basename(), f"Cannot read: {e.message}")
+            return
+        bad = check_image(data)
+        if bad:
+            self._set_file(None, gfile.get_basename(), f"Refused: {bad}")
+            return
+        import hashlib
+        ver = image_version(data)
+        sub = f"{len(data):,} bytes · SHA-256 {hashlib.sha256(data).hexdigest()[:16]}…\n"
+        if ver:
+            sub += f"version {ver}"
+        else:
+            sub += ("version not stated (EEVblog v2.05 or open firmware before v1.0.1): once installed, "
+                    "uploads over Bluetooth need the SD card route again")
+        self._set_file(data, gfile.get_basename(), sub)
+
+    def _set_file(self, data, name, subtitle):
+        self.data = data
+        self.file_row.set_title(GLib.markup_escape_text(name))
+        self.file_row.set_subtitle(GLib.markup_escape_text(subtitle))
+        self.upload_btn.set_sensitive(data is not None and self.link.is_connected)
+        self.progress.set_fraction(0.0)
+        self.progress.set_text("")
+        self.status.set_label("" if data is not None else "Choose an EEVBlog.bin firmware image.")
+
+    def _start(self, *_):
+        if self.data is None:
+            return
+        self.upload_btn.set_sensitive(False)
+        self.choose_btn.set_sensitive(False)
+        self.cancel_btn.set_sensitive(True)
+        self.status.remove_css_class("error")
+        self.status.remove_css_class("success")
+        self.status.set_label("Waiting for the meter (page Ld)…")
+        self.set_can_close(False)
+        self.link.upload_firmware(self.data, self._progress, self._done)
+
+    def _progress(self, fraction, sent, total, rate):
+        self.progress.set_fraction(fraction)
+        self.progress.set_text(f"{fraction * 100:.0f} %")
+        if sent >= total:
+            self.status.set_label("Meter checks the file and writes EEVBlog.bin on the card…")
+        else:
+            left = (total - sent) / rate if rate > 0 else 0
+            self.status.set_label(f"{sent:,} / {total:,} bytes · {rate:,.0f} B/s · about {left:.0f} s left")
+
+    def _done(self, ok, text):
+        self.set_can_close(True)
+        self.cancel_btn.set_sensitive(False)
+        self.choose_btn.set_sensitive(True)
+        self.upload_btn.set_sensitive(self.data is not None and self.link.is_connected)
+        if ok:
+            self.progress.set_fraction(1.0)
+            self.progress.set_text("100 %")
+        self.status.remove_css_class("dim-label")
+        self.status.add_css_class("success" if ok else "error")
+        self.status.set_label(text)
+        if text != "Upload cancelled":
+            self.win.toast("Firmware upload finished" if ok else "Firmware upload failed")
+
+    def _close_attempt(self, *_):
+        d = Adw.AlertDialog(heading="Stop the upload?",
+                            body="The file on the meter's card stays as it was; send it again later.")
+        d.add_response("keep", "Keep Uploading")
+        d.add_response("stop", "Stop and Close")
+        d.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.set_close_response("keep")
+
+        def answered(_d, r):
+            if r == "stop":
+                self.link.cancel_upload()
+                self.force_close()
+
+        d.connect("response", answered)
+        d.present(self)
+
+    def _closed(self, *_):
+        self.link.cancel_upload()
+        self.link.upload_mode = False
+        self.win.refresh()
