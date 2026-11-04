@@ -49,6 +49,7 @@ class BluezLink(MeterLink):
         self.device_path: str | None = None
         self.notify_char: str | None = None
         self.write_char: str | None = None
+        self.write_mtu = 0                      # ATT MTU of the write characteristic (BlueZ 5.62+; 0 = not known)
         self.write_type = "request"
         self._subs: list[int] = []
         self._resolve_timeout_id = 0
@@ -393,6 +394,7 @@ class BluezLink(MeterLink):
         if write:
             self.write_char = write[0]
             self.write_type = "request" if "write" in write[1].get("Flags", []) else "command"
+            self._read_write_mtu()
         self.set_status("Enabling indications…")
 
         def notified(_res, err):
@@ -493,6 +495,19 @@ class BluezLink(MeterLink):
         self.start_scan()
 
     # ---- keys --------------------------------------------------------------
+
+    def _read_write_mtu(self) -> None:
+        self.write_mtu = 0
+        path = self.write_char
+
+        def got(res, err):
+            if not err and res is not None and path == self.write_char:
+                self.write_mtu = int(res.unpack()[0])
+        self._call(path, "org.freedesktop.DBus.Properties", "Get", GLib.Variant("(ss)", (IFACE_CHAR, "MTU")), got)
+
+    def write_piece_size(self) -> int:
+        # one ATT write carries MTU - 3 bytes; BlueZ without the MTU property: the minimum MTU 23 (the 121GW's)
+        return max(20, self.write_mtu - 3) if self.write_mtu else 20
 
     def write_frame(self, payload: bytes, done=None) -> None:
         """Write a command frame to the meter; done(error message or None) after BlueZ answers."""

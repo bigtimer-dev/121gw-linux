@@ -73,6 +73,7 @@ class MeterLink:
         self._upload: UploadSession | None = None
         self._upload_parser = AnswerParser()
         self._upload_timer = 0
+        self._pieces_gen = 0            # bumped to drop the rest of a packet being written in pieces
         self._upload_t0 = 0.0
         self._upload_progress: Callable[[float, int, int, float], None] | None = None
         self._upload_done: Callable[[bool, str], None] | None = None
@@ -302,7 +303,40 @@ class MeterLink:
         if self._upload is not None:
             abort = self._upload.abort_packet()
             self._upload_finish(False, "Upload cancelled")
-            self.write_frame(abort, None)           # the meter goes back to waiting (Ld-bt)
+            self._pieces_gen += 1                   # stop a packet still being written in pieces
+            # after 200 ms without a byte the meter drops a half-received packet; then ABORT: back to waiting (Ld-bt)
+            GLib.timeout_add(300, lambda: (self._write_pieces(abort, None), GLib.SOURCE_REMOVE)[1])
+
+    def write_piece_size(self) -> int:
+        """The largest write the link carries in one go (0 = any size)."""
+        return 0
+
+    def _write_pieces(self, payload: bytes, done: Callable[[str | None], None] | None) -> None:
+        """Write payload in pieces of write_piece_size(), one after the other; done(error) after the last.
+
+        With the 121GW's ATT MTU of 23 a 240-byte upload packet is otherwise one BlueZ long write (prepare + execute,
+        18 bytes per round trip): measured 1.55 s per packet against 1.15 s in 20-byte writes at a 45 ms connection
+        interval, 0.63 s against 0.40 s at 15 ms (where the long writes also lost 3 of 25 packets). The meter puts
+        the bytes together again (a packet ends after 200 ms without a byte, firmware ble/bft.s)."""
+        n = self.write_piece_size()
+        if not n or len(payload) <= n:
+            self.write_frame(payload, done)
+            return
+        pieces = [payload[i:i + n] for i in range(0, len(payload), n)]
+        gen = self._pieces_gen
+
+        def after(i: int):
+            def cb(err: str | None) -> None:
+                if gen != self._pieces_gen:
+                    return
+                if err or i + 1 == len(pieces):
+                    if done:
+                        done(err)
+                    return
+                self.write_frame(pieces[i + 1], after(i + 1))
+            return cb
+
+        self.write_frame(pieces[0], after(0))
 
     def _upload_send(self) -> None:
         up = self._upload
@@ -311,7 +345,8 @@ class MeterLink:
         step = up.step()
         self._upload_stop_timer()
         self._upload_timer = GLib.timeout_add(step.timeout_ms, self._upload_timed_out)
-        self.write_frame(step.packet, self._upload_written)
+        self._pieces_gen += 1
+        self._write_pieces(step.packet, self._upload_written)
 
     def _upload_written(self, error: str | None) -> None:
         if error and self._upload is not None:

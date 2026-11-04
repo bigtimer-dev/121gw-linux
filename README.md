@@ -48,6 +48,23 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
   The meter writes to a temporary file and replaces `EEVBlog.bin` only after the length and CRC-32 match, so a
   cancelled or broken upload leaves the card as it was. The upload takes a few minutes (stop and wait, one 232-byte
   packet per answer).
+
+  **Speed.** Many 121GWs answer the Bluetooth MTU exchange with 23 bytes (seen with `btmon`: `Server RX MTU: 23`), so
+  one write carries 20 bytes. The app sends each packet in writes of that size (or of the link's MTU when larger) and
+  sends a packet again after 3 s without an answer. With Linux's default connection interval (30–50 ms) a full image
+  takes about 13 minutes (estimated from the measured 1.15 s per packet); with 15 ms for the meter about 5½ minutes (measured, C-1.03, 156 KB). To set 15 ms for the
+  meter only, add to `/var/lib/bluetooth/<adapter>/<meter address>/info` (as root) and restart Bluetooth:
+
+      [ConnectionParameters]
+      MinInterval=12
+      MaxInterval=12
+      Latency=0
+      Timeout=42
+
+  Measured full uploads of the 156 KB image on one meter: 15 ms 5½ min (11 packets sent again); 7.5 ms (`6`) 17 min
+  (282 sent again); 11.25 ms (`9`) 13½ min, the same speed as the default, so it was apparently not applied. The
+  meter's serial line (19200 baud) limits any setting to about 1½ minutes. Every upload, slow or not, ended with the
+  meter's own check (length, CRC-32, image header, copy read back): a lost packet costs time, not data.
 - **Meter Views** (main menu), for meters with zombu4's open firmware v0.9.6 or later: shows DC mA as percent of a
   **4–20 mA / 0–20 mA loop** and Ω as the temperature of a **PT100 / PT1000** sensor, as the meter's SETUP pages
   `LP` and `Pt` do. The Bluetooth frame doesn't say which view the meter shows, so set the same view here. The app

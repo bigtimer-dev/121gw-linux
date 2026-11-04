@@ -1,5 +1,8 @@
 import struct
+import time
 import unittest
+
+from gi.repository import GLib
 
 from gw121 import upload as U
 from gw121.demo import DemoSdReceiver
@@ -144,6 +147,37 @@ class FakeLink(MeterLink):
             self.ingest(answer[5:])
 
 
+def spin(seconds: float) -> None:
+    ctx, end = GLib.MainContext.default(), time.monotonic() + seconds
+    while time.monotonic() < end:
+        ctx.iteration(False)
+        time.sleep(0.01)
+
+
+class PieceLink(FakeLink):
+    """Takes at most 20 bytes per write; the meter side joins the bytes into packets as the firmware does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rx = b""
+
+    def write_piece_size(self) -> int:
+        return 20
+
+    def write_frame(self, payload: bytes, done=None) -> None:
+        assert len(payload) <= 20, len(payload)
+        self.written.append(bytes(payload))
+        self.rx += payload
+        if done:
+            done(None)
+        if len(self.rx) >= 6 and len(self.rx) >= 8 + self.rx[5]:
+            n = 8 + self.rx[5]
+            p, self.rx = self.rx[:n], self.rx[n:]
+            answer = self.meter.packet(p)
+            if answer:
+                self.ingest(answer)
+
+
 class LinkTests(unittest.TestCase):
     def test_link_drives_the_upload(self):
         link, data = FakeLink(), image(3000)
@@ -161,8 +195,31 @@ class LinkTests(unittest.TestCase):
         link.upload_firmware(image(), lambda *_: None, lambda ok, t: result.append((ok, t)))
         link.cancel_upload()
         self.assertEqual(result, [(False, "Upload cancelled")])
+        self.assertNotEqual(link.written[-1][2], U.T_ABORT)       # not at once: the meter first drops a half packet
+        spin(0.5)
         self.assertEqual(link.written[-1][2], U.T_ABORT)
         self.assertFalse(link.uploading)
+
+    def test_pieces_of_20_bytes(self):
+        """A link that takes 20 bytes per write (ATT MTU 23, the 121GW): the packets go in pieces, the meter joins them."""
+        link, data = PieceLink(), image(3000)
+        result = []
+        link.upload_firmware(data, lambda *_: None, lambda ok, t: result.append((ok, t)))
+        self.assertEqual(result and result[0][0], True, result)
+        self.assertEqual(link.meter.card, data)
+        self.assertLessEqual(max(map(len, link.written)), 20)
+        self.assertGreater(len(link.written), 13 * 12)       # 13 DATA packets of 240 bytes, 12 pieces each
+
+    def test_cancel_stops_the_pieces(self):
+        link = PieceLink()
+        held = []
+        link.write_frame = lambda payload, done=None: (link.written.append(bytes(payload)), held.append(done))
+        link.upload_firmware(image(), lambda *_: None, lambda *_: None)
+        self.assertEqual(len(link.written), 1)                # START (17 bytes) went in one piece
+        link.cancel_upload()
+        held[-1](None)                                        # the write of the last piece finishes after the cancel
+        spin(0.5)
+        self.assertEqual([p[2] for p in link.written if len(p) > 2 and p[:2] == b"\xB5\x5B"][-1], U.T_ABORT)
 
     def test_watchdog_quiet_on_page_ld(self):
         link = FakeLink()

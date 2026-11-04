@@ -25,7 +25,12 @@ T_START, T_DATA, T_END, T_ABORT = 1, 2, 3, 4
 MAX_PAYLOAD = 232
 MIN_SIZE, MAX_SIZE = 0x124, 0x5A000
 RETRIES = 8
-TIMEOUT_DATA_MS = 20_000          # a card write of the 8 KiB buffer can take a second; generous
+RETRIES_DATA = 20                 # DATA without an answer: 20 x 3 s of silence (card writes take about a second)
+TIMEOUT_START_MS = 5_000          # opens the temporary file on the card
+# About 1.5 % of the DATA packets or their answers are lost on a real 121GW (MTU 23, 20-byte writes, measured
+# 2026-11-04): with 20 s each those waits were 200 of the 476 s of an upload. The meter writes the card before it
+# answers, so an answer comes within about a second; a packet sent again that had arrived gets "expected n+1".
+TIMEOUT_DATA_MS = 3_000
 TIMEOUT_END_MS = 120_000          # check, copy and read back of the whole file
 
 STATUS_TEXT = {
@@ -127,7 +132,7 @@ class UploadSession:
     def step(self) -> Step:
         if self.phase == "start":
             crc = zlib.crc32(self.data) & 0xFFFFFFFF
-            return Step(packet(T_START, 0, struct.pack("<II", len(self.data), crc)), 0, TIMEOUT_DATA_MS)
+            return Step(packet(T_START, 0, struct.pack("<II", len(self.data), crc)), 0, TIMEOUT_START_MS)
         if self.phase == "data":
             return Step(packet(T_DATA, self.n, self.chunks[self.n]), self.n, TIMEOUT_DATA_MS)
         return Step(packet(T_END, len(self.chunks)), len(self.chunks), TIMEOUT_END_MS)
@@ -195,12 +200,12 @@ class UploadSession:
 
     def _retry(self, why: str) -> bool:
         self.tries += 1
-        if self.tries >= RETRIES:
+        if self.tries >= (RETRIES_DATA if self.phase == "data" else RETRIES):
             if self.phase == "start":
                 self._fail("The meter did not answer. On the meter: Bluetooth on, SETUP page Ld (shows Ld-bt, after "
                            "the page bt), logging off. The page needs zombu4's open firmware v1.0.0 or later.")
             else:
-                self._fail(f"{why} after {RETRIES} attempts")
+                self._fail(f"{why} after {self.tries} attempts")
             return False
         return True
 
