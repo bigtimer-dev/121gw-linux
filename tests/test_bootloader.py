@@ -267,6 +267,16 @@ class BootLinkTests(unittest.TestCase):
         self.assertTrue(wait(lambda: eev.bootloader == "B-EEV", 2))
         self.assertFalse(eev.direct_update)
 
+    def test_version_asked_again_after_a_reconnect(self):
+        link = BootLink()
+        self.stream(link, 20)                       # a long first connection
+        link._reset_link_state()                    # the meter restarts (new firmware), the link comes back
+        link.is_connected = True
+        link.written.clear()
+        self.stream(link, 3)
+        from gw121.keys import VERSION_REQUEST
+        self.assertIn(VERSION_REQUEST, link.written)
+
     def test_full_update_from_the_firmware(self):
         link, data = BootLink(), image(6000)
         link._start_watchdog()

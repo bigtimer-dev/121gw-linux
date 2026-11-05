@@ -49,6 +49,7 @@ class MeterLink:
         self.latest: PacketV2 | None = None
         self.rssi: int | None = None
         self.packets_received = 0
+        self._conn_packets = 0          # readings on this connection: the version questions follow these
         self.battery_voltage: float | None = None
         self.meter_time: str | None = None
         self.communication_lost = False
@@ -238,16 +239,17 @@ class MeterLink:
         self._last_packet_at = time.monotonic()
         self.communication_lost = False
         self.packets_received += 1
+        self._conn_packets += 1
         if pkt.sub_mode_raw == 110 and math.isfinite(pkt.sub_value):
             self.battery_voltage = abs(pkt.sub_value)
         elif pkt.sub_mode_raw == 140:
             n = abs(pkt.sub_int_value)
             self.meter_time = f"{min(23, (n >> 8) & 0xFF):02d}:{min(59, n & 0xFF):02d}"
-        if self.firmware_version is None and self.packets_received in (2, 12) and self._version_asks < 2:
+        if self.firmware_version is None and self._conn_packets in (2, 12) and self._version_asks < 2:
             self._version_asks += 1                 # ask once the link streams; once more if the answer was lost
             self.write_frame(VERSION_REQUEST, None)
         elif self.bootloader is None and self._asks_bootloader() and self._boot_asks < 2 and \
-                self.packets_received in (4, 16, 30):
+                self._conn_packets in (4, 16, 30):
             self._boot_asks += 1
             self.write_frame(BOOTLOADER_INFO_REQUEST, None)
         for fn in list(self._packet_listeners):
@@ -323,6 +325,7 @@ class MeterLink:
         self.firmware_version = None
         self._version_tail.clear()
         self._version_asks = 0
+        self._conn_packets = 0
         self.setup_text = None
         self._setup_buf.clear()
         self.on_ld_page = False
