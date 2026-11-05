@@ -83,6 +83,10 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
   A meter running an older custom build is offered it automatically; the download is used only when its SHA-256, the
   image check and the version inside it match. While the meter is on SETUP page `Ld` (no readings) the app says so in
   a banner instead of "communication lost".
+- **Statistics** (Live page, under the display): min, max, average, standard deviation (sample, n − 1), peak-to-peak
+  and count of the readings, as zombu4's companion shows them, with the start time and a **Reset** button. Overload
+  readings are skipped and counted. The values are in one unit per mode (V for DCV in every range), so autoranging
+  doesn't restart them; a change of mode, AC/DC or unit does (`gw121/livestats.py`).
 - **Meter Views** (main menu), for meters with zombu4's open firmware v0.9.6 or later: shows DC mA as percent of a
   **4–20 mA / 0–20 mA loop** and Ω as the temperature of a **PT100 / PT1000** sensor, as the meter's SETUP pages
   `LP` and `Pt` do. The Bluetooth frame doesn't say which view the meter shows, so set the same view here. The app

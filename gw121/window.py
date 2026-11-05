@@ -12,6 +12,7 @@ from .chart import TrendChart, export_png, fmt_elapsed, fmt_num
 from .continuity import ContinuityEngine
 from .keys import KEYPAD, MeterKey
 from .lcd import LcdView
+from .livestats import LiveStats
 from .link import MeterLink
 from .packet import PacketV2
 from .sessions import LIVE_WINDOW, DataPoint, Session, SessionStore, default_session_name
@@ -105,6 +106,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.continuity = ContinuityEngine(settings)
         # append-only so the chart summary stays incremental; trimmed only occasionally
         self.preview: list[DataPoint] = []
+        self.live_stats = LiveStats()
         self._preview_fp: str | None = None
         self._last_synced_beep: float | None = None
         self._dialog_open = False
@@ -220,6 +222,7 @@ class MainWindow(Adw.ApplicationWindow):
         setup_list.append(self.setup_row)
         self.setup_box = setup_list
         box.append(setup_list)
+        box.append(self._build_live_stats())
 
         # meter controls
         ctl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -489,11 +492,75 @@ class MainWindow(Adw.ApplicationWindow):
     # Live updates
     # =====================================================================
 
+    STAT_TILES = (("min", "Min"), ("max", "Max"), ("avg", "Average"), ("std", "Std dev"), ("pp", "Peak-Peak"),
+                  ("n", "Count"))
+
+    def _build_live_stats(self) -> Gtk.Widget:
+        """Running min / max / average / standard deviation of the readings (as zombu4's companion shows them)."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        head = Gtk.Box(spacing=6)
+        t = Gtk.Label(label="Statistics", xalign=0)
+        t.add_css_class("card-title")
+        head.append(t)
+        self.stats_since = Gtk.Label(xalign=0, hexpand=True, ellipsize=3)
+        self.stats_since.add_css_class("caption")
+        self.stats_since.add_css_class("dim-label")
+        head.append(self.stats_since)
+        reset = Gtk.Button(label="Reset", has_frame=False, valign=Gtk.Align.CENTER,
+                           tooltip_text="Start the statistics again (they also restart when the meter's mode changes)")
+        reset.add_css_class("caption")
+        reset.connect("clicked", lambda *_: self._reset_live_stats())
+        head.append(reset)
+        box.append(head)
+        grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=3, min_children_per_line=3,
+                           column_spacing=6, row_spacing=6, homogeneous=True)
+        self.stat_values: dict[str, Gtk.Label] = {}
+        for key, title in self.STAT_TILES:
+            tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            tile.add_css_class("stat-tile")
+            a = Gtk.Label(label=title, xalign=0)
+            a.add_css_class("stat-title")
+            b = Gtk.Label(label="—", xalign=0, selectable=True, ellipsize=3)
+            b.add_css_class("stat-value")
+            tile.append(a)
+            tile.append(b)
+            self.stat_values[key] = b
+            grid.append(Gtk.FlowBoxChild(focusable=False, child=tile))
+        box.append(grid)
+        self.stats_since.set_label("waiting for readings")
+        return _card(box, 10)
+
+    def _reset_live_stats(self) -> None:
+        self.live_stats.reset()
+        self._show_live_stats()
+
+    def _show_live_stats(self) -> None:
+        st = self.live_stats
+        u = st.unit
+
+        def val(v):
+            return "—" if v is None else f"{fmt_num(v)} {u}".strip()
+
+        for key, v in (("min", st.min), ("max", st.max), ("avg", st.mean), ("std", st.std),
+                       ("pp", st.peak_to_peak)):
+            self.stat_values[key].set_label(val(v))
+        self.stat_values["n"].set_label(f"{st.n:,}")
+        if st.started is None:
+            self.stats_since.set_label("waiting for readings")
+        else:
+            text = (f"since {datetime.fromtimestamp(st.started):%H:%M:%S} · "
+                    f"{fmt_elapsed(max(0.0, datetime.now().timestamp() - st.started))}")
+            if st.skipped:
+                text += f" · {st.skipped} OL skipped"
+            self.stats_since.set_label(text)
+
     def _on_packet(self, pkt: PacketV2) -> None:
         if not self.store.append(pkt):
             self._function_changed()
         self.continuity.evaluate(pkt)
         self._sync_continuity_threshold(pkt)
+        self.live_stats.add(pkt.measure_fingerprint, pkt.graph_value, pkt.graph_unit)
+        self._show_live_stats()
 
         if math.isfinite(pkt.main_value):
             fp = pkt.measure_fingerprint
