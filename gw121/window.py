@@ -10,6 +10,7 @@ from typing import Callable
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from .chart import TrendChart, export_png, fmt_elapsed, fmt_num
+from .bootdialog import BootloaderDialog
 from .cardview import CardPage, MeterSettingsPage, Worker
 from .continuity import ContinuityEngine
 from .keys import KEYPAD, MeterKey
@@ -139,6 +140,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append_submenu("Meter Views", self._views_menu())
         menu.append("Upload Firmware…", "win.upload-firmware")
         menu.append("Check for Firmware Update", "win.check-update")
+        menu.append("Bootloader…", "win.bootloader")
         theme_menu = Gio.Menu()
         theme_menu.append("Companion Dark", "win.theme::companion")
         theme_menu.append("System", "win.theme::system")
@@ -163,6 +165,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.upload_action = Gio.SimpleAction.new("upload-firmware", None)
         self.upload_action.connect("activate", lambda *_: UploadDialog(self).present(self))
         self.add_action(self.upload_action)
+        self.bootloader_action = Gio.SimpleAction.new("bootloader", None)
+        self.bootloader_action.connect("activate", lambda *_: BootloaderDialog(self).present(self))
+        self.add_action(self.bootloader_action)
         act = Gio.SimpleAction.new("check-update", None)
         act.connect("activate", lambda *_: self._check_update(manual=True))
         self.add_action(act)
@@ -929,6 +934,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.card_page.busy_changed(busy)
         self.meter_page.busy_changed(busy)
         self.upload_action.set_enabled(not busy)
+        self.bootloader_action.set_enabled(not busy)
 
     # ---- newer custom firmware (gw121/releases.py) ---------------------------
 

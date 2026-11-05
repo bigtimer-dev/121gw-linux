@@ -27,6 +27,20 @@ Put the meter on its SETUP page `Ld-bt` (SETUP, then REL / PEAK to the page afte
   EEPROM itself. Calibration, identity and the logging interval are not offered by the firmware.
 - With older firmware the pages say which version is needed.
 
+**Bootloader…** (main menu): installs or updates zombu4's two-part bootloader from his newest `bl-v*` release. The
+zip is checked against its published SHA-256 and every file against the `SHA256SUMS` inside. Then, depending on what
+the meter reports:
+- **Update** (the meter has his bootloader, e.g. `B-1.11`): the meter restarts into its update mode and receives
+  `blimage.bin` (about 20 s) into a spare slot. After a restart its starter copies the new bootloader in. The
+  running bootloader is replaced only after the whole image has arrived and been checked. Done on a real meter
+  (B-1.11 → B-1.12).
+- **First install** (the meter has EEVblog's bootloader, firmware `F-1.04` / `C-1.04` or later): with the meter on
+  `Ld-bt`, the meter receives `install.bin` and checks the battery (refuses below 4.80 V, `LdE 8`) and that its
+  bootloader is EEVblog's (`LdE 7` if not). It then writes the bootloader and restarts. For about 10 ms of that
+  write a power cut would leave the meter unable to start, so keep fresh batteries in. Only checked in the
+  emulator up to the meter's refusals: EEVblog's bootloader image isn't available here.
+- Either way the app waits until the meter reports the new version. Calibration and settings are never written.
+
 **Theme**: *Companion Dark* (the default) follows the look of zombu4's 121GW Companion: near-black, warm grey
 text and the meter's yellow as the only accent. *System* (main menu → Theme) uses the desktop's own colours.
 

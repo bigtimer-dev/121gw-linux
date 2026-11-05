@@ -356,3 +356,73 @@ class BootloaderKindTests(unittest.TestCase):
         size, crc, kind, ver = _s.unpack_from("<IIBI", pkt, 6)
         self.assertEqual((size, kind, ver), (300, 2, 0x010102))
         self.assertEqual(len(U.BootSession(b"x" * 300).to_send()[0]), 8 + 9)
+
+
+class BootloaderReleaseTests(unittest.TestCase):
+    def _zip(self, inst, boot, tamper=None):
+        import hashlib, io, zipfile
+        files = {"install.bin": inst, "blimage.bin": boot}
+        sums = "".join(f"{hashlib.sha256(d).hexdigest()}  {n}\n" for n, d in files.items())
+        if tamper:
+            files[tamper] = files[tamper][:-1] + b"\x00"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            for n, d in files.items():
+                z.writestr(n, d)
+            z.writestr("SHA256SUMS", sums)
+        blob = buf.getvalue()
+        return blob, hashlib.sha256(blob).hexdigest().encode()
+
+    def _files(self):
+        import struct as _s
+        boot = bytes(range(256)) * 4
+        inst = bytearray(0x500 + len(boot))
+        _s.pack_into("<II", inst, 0, 0x20002000, 0x08000101)
+        _s.pack_into("<I", inst, 0x400, 0x32484C42)
+        inst[0x500:] = boot
+        inst += bytes(-len(inst) % 128)
+        return bytes(inst), boot
+
+    def test_zip_checks(self):
+        from gw121 import releases as R
+        rel = R.BootloaderRelease((1, 1, 2), "bl-v1.1.2", "", "", "")
+        inst, boot = self._files()
+        blob, sha = self._zip(inst, boot)
+        self.assertEqual(R.check_bootloader_zip(rel, blob, sha), (inst, boot))
+        with self.assertRaises(ValueError):
+            R.check_bootloader_zip(rel, blob, b"00" * 32)               # zip SHA-256 wrong
+        blob2, sha2 = self._zip(inst, boot, tamper="blimage.bin")
+        with self.assertRaises(ValueError):
+            R.check_bootloader_zip(rel, blob2, sha2)                   # file not as in SHA256SUMS
+        self.assertEqual(rel.meter_text, "B-1.12")
+        self.assertEqual(rel.header_version, 0x010102)
+
+    def test_versions(self):
+        from gw121 import releases as R
+        rel = R.BootloaderRelease((1, 1, 2), "bl-v1.1.2", "", "", "")
+        self.assertTrue(R.bootloader_is_newer(rel, "B-1.11"))
+        self.assertFalse(R.bootloader_is_newer(rel, "B-1.12"))
+        self.assertFalse(R.bootloader_is_newer(rel, "B-EEV"))       # first install is its own route
+        items = [{"tag_name": t, "assets": [{"name": f"bootloader-{t}.zip", "browser_download_url": "z"},
+                                             {"name": f"bootloader-{t}.zip.sha256", "browser_download_url": "s"}]}
+                 for t in ("bl-v1.1.1", "bl-v1.1.2", "v1.0.6")]
+        self.assertEqual(R.parse_bootloader_releases(items).tag, "bl-v1.1.2")
+
+    def test_first_install_start_and_end(self):
+        import struct as _s
+        s = U.UploadSession(b"y" * 0x600, U.KIND_INSTALL)
+        st = s.step()
+        self.assertEqual(st.packet[5], 9)                             # size, crc32, kind
+        self.assertEqual(st.packet[6 + 8], U.KIND_INSTALL)
+        self.assertEqual(len(U.UploadSession(b"y" * 0x600).step().packet), 8 + 8)
+        s.answer(0, 0, 0)
+        while s.phase == "data":
+            s.answer(s.n, 0, s.n + 1)
+        s2 = U.UploadSession(b"y" * 0x600, U.KIND_INSTALL)
+        s2.phase = "end"
+        s2.answer(s2.step().seq, 0x18, 0)
+        self.assertFalse(s2.ok)
+        self.assertIn("4.80 V", s2.message)
+        while s.timeout():                                            # END unanswered: the meter may have restarted
+            pass
+        self.assertTrue(s.unconfirmed)

@@ -498,13 +498,13 @@ class MeterLink:
         return self._upload is not None or self._boot_job is not None
 
     def upload_firmware(self, data: bytes, on_progress: Callable[[float, int, int, float], None],
-                        on_done: Callable[[bool, str], None]) -> None:
+                        on_done: Callable[[bool, str], None], kind: int | None = None) -> None:
         """Send a firmware file to the meter's SD card; on_progress(fraction, sent, total, bytes/s), on_done(ok, text)."""
         if not self.is_connected:
             on_done(False, "Not connected")
             return
         self.cancel_upload()
-        self._upload = UploadSession(data)
+        self._upload = UploadSession(data, kind)
         self._upload_parser.clear()
         self._answer_raw.clear()
         self._upload_progress, self._upload_done = on_progress, on_done

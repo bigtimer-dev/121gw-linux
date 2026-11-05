@@ -39,7 +39,12 @@ STATUS_TEXT = {
     0x11: "the SD card could not be written", 0x12: "length or CRC-32 of the received file wrong",
     0x13: "not a firmware image", 0x14: "copy to EEVBlog.bin failed", 0x15: "EEVBlog.bin read back differs",
     0x16: "the received file could not be read back",
+    0x17: "the meter's bootloader is not one of EEVblog's builds (nothing was written; zombu4's bootloader is "
+          "probably installed already)",
+    0x18: "battery below 4.80 V (nothing was written): put in fresh batteries",
+    0x19: "the install file or a flash step failed",
 }
+KIND_INSTALL = 1                    # START kind of the first install of zombu4's two-part bootloader (firmware writes it)
 CARD_STEP = {1: "open", 2: "seek", 3: "write", 4: "short write (card full?)", 5: "close", 6: "read back"}
 
 
@@ -133,8 +138,10 @@ class Step:
 class UploadSession:
     """START, every DATA packet, END; one packet in flight. done / ok / message tell the outcome."""
 
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, kind: int | None = None) -> None:
         self.data = bytes(data)
+        self.kind = kind              # None: EEVBlog.bin to the card; KIND_INSTALL: the bootloader's first install
+        self.unconfirmed = False      # first install: END sent, but its answer did not come (the meter may restart)
         self.chunks = [self.data[i:i + MAX_PAYLOAD] for i in range(0, len(self.data), MAX_PAYLOAD)]
         self.phase = "start"
         self.n = 0                    # next DATA packet
@@ -149,7 +156,8 @@ class UploadSession:
     def step(self) -> Step:
         if self.phase == "start":
             crc = zlib.crc32(self.data) & 0xFFFFFFFF
-            return Step(packet(T_START, 0, struct.pack("<II", len(self.data), crc)), 0, TIMEOUT_START_MS)
+            start = struct.pack("<II", len(self.data), crc) + (bytes([self.kind]) if self.kind is not None else b"")
+            return Step(packet(T_START, 0, start), 0, TIMEOUT_START_MS)
         if self.phase == "data":
             return Step(packet(T_DATA, self.n, self.chunks[self.n]), self.n, TIMEOUT_DATA_MS)
         return Step(packet(T_END, len(self.chunks)), len(self.chunks), TIMEOUT_END_MS)
@@ -207,6 +215,10 @@ class UploadSession:
         else:
             self.repeated_card_sessions = nxt
             self.done, self.ok = True, True
+            if self.kind == KIND_INSTALL:
+                self.message = ("The meter wrote zombu4's bootloader and restarts now; its starter installs it "
+                                "(display blank for about a second), then the firmware starts.")
+                return True
             self.message = ("EEVBlog.bin is on the meter's SD card and verified. To install it: switch the meter off, "
                             "hold MEM + HOLD while switching it on, then press SETUP.")
         return True
@@ -221,6 +233,11 @@ class UploadSession:
     def _retry(self, why: str) -> bool:
         self.tries += 1
         if self.tries >= (RETRIES_DATA if self.phase == "data" else RETRIES):
+            if self.phase == "end" and self.kind == KIND_INSTALL:
+                # the firmware may restart before its END answer goes out: the meter's report after the restart decides
+                self.unconfirmed = True
+                self._fail("No answer to END: the meter may have restarted to install the bootloader")
+                return False
             if self.phase == "start":
                 self._fail("The meter did not answer. On the meter: Bluetooth on, SETUP page Ld (shows Ld-bt, after "
                            "the page bt), logging off. The page needs zombu4's open firmware v1.0.0 or later.")

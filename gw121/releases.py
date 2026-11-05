@@ -8,9 +8,12 @@ the image passes check_image and the version inside it is the release's. Standar
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
+import struct
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,3 +118,126 @@ def download(release: Release, cache_dir: Path | None = None) -> bytes:
         cache_dir.mkdir(parents=True, exist_ok=True)
         (cache_dir / f"{release.version}.bin").write_bytes(image)
     return image
+
+
+# ---- zombu4's two-part bootloader (releases bl-vA.B.C of zombu4/121GW-Open-Firmware) ---------------------------
+
+BL_REPO = "zombu4/121GW-Open-Firmware"
+BL_API = f"https://api.github.com/repos/{BL_REPO}/releases?per_page=50"
+_BL_TAG = re.compile(r"^bl-v(\d+)\.(\d+)\.(\d+)$")
+_BL_METER = re.compile(r"^B-(\d)\.(\d)(\d)$")
+BL_HEADER_MAGIC = 0x32484C42                # "BLH2", the slot header after the starter in install.bin
+
+
+@dataclass(frozen=True)
+class BootloaderRelease:
+    version: tuple[int, int, int]           # (1, 1, 2)
+    tag: str                                # "bl-v1.1.2"
+    zip_url: str
+    sha_url: str
+    page_url: str
+
+    @property
+    def meter_text(self) -> str:            # "B-1.12", as the meter reports it
+        a, b, c = self.version
+        return f"B-{a}.{b}{c}"
+
+    @property
+    def header_version(self) -> int:        # sent with the image in the bootloader's START
+        a, b, c = self.version
+        return a << 16 | b << 8 | c
+
+
+def bootloader_key(text: str | None) -> tuple[int, int, int] | None:
+    """(A, B, C) of the meter's "B-A.BC"; None for EEVblog's ("B-EEV") or unknown."""
+    m = _BL_METER.match(text or "")
+    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+
+
+def parse_bootloader_releases(items: list) -> BootloaderRelease | None:
+    best = None
+    for r in items:
+        if not isinstance(r, dict) or r.get("draft") or r.get("prerelease"):
+            continue
+        m = _BL_TAG.match(r.get("tag_name") or "")
+        if not m:
+            continue
+        zname = f"bootloader-{r['tag_name']}.zip"
+        assets = {a.get("name"): a.get("browser_download_url") for a in r.get("assets") or [] if isinstance(a, dict)}
+        if not assets.get(zname) or not assets.get(zname + ".sha256"):
+            continue
+        v = (int(m[1]), int(m[2]), int(m[3]))
+        if best is None or v > best.version:
+            best = BootloaderRelease(v, r["tag_name"], assets[zname], assets[zname + ".sha256"], r.get("html_url") or "")
+    return best
+
+
+def fetch_latest_bootloader() -> BootloaderRelease | None:
+    return parse_bootloader_releases(json.loads(_get(BL_API, "application/vnd.github+json")))
+
+
+def bootloader_is_newer(release: BootloaderRelease | None, meter_bootloader: str | None) -> bool:
+    have = bootloader_key(meter_bootloader)
+    return release is not None and have is not None and release.version > have
+
+
+def check_install_file(data: bytes) -> str | None:
+    """The checks the firmware makes before a first install (ble/bft.s): None or why not."""
+    if not 0x580 <= len(data) <= 0x6000 or len(data) % 128:
+        return f"install file of {len(data)} bytes: 0x580 .. 0x6000 in whole half-pages expected"
+    sp, reset = struct.unpack_from("<II", data, 0)
+    if not 0x20000001 <= sp <= 0x2000C000 or not reset & 1 or not 0x08000000 <= reset < 0x08000400:
+        return "the starter part has no valid vector table"
+    if struct.unpack_from("<I", data, 0x400)[0] != BL_HEADER_MAGIC:
+        return "no bootloader header after the starter"
+    return None
+
+
+def check_bootloader_zip(release: BootloaderRelease, blob: bytes, sha_text: bytes) -> tuple[bytes, bytes]:
+    """(install.bin, blimage.bin) out of the release zip; ValueError when any check fails: the zip's published SHA-256,
+    every file against SHA256SUMS inside the zip, the firmware's install-file checks, and the same bootloader in both."""
+    want = (sha_text.decode("ascii", "replace").split() or [""])[0].lower()
+    if hashlib.sha256(blob).hexdigest() != want:
+        raise ValueError(f"{release.tag}: the zip does not match its published SHA-256")
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        names = set(z.namelist())
+        if not {"install.bin", "blimage.bin", "SHA256SUMS"} <= names:
+            raise ValueError(f"{release.tag}: the zip lacks install.bin, blimage.bin or SHA256SUMS")
+        files = {n: z.read(n) for n in ("install.bin", "blimage.bin")}
+        sums = z.read("SHA256SUMS").decode("utf-8", "replace")
+    listed = {}
+    for line in sums.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            listed[parts[1].lstrip("*").split("/")[-1]] = parts[0].lower()
+    for name, data in files.items():
+        if listed.get(name) != hashlib.sha256(data).hexdigest():
+            raise ValueError(f"{release.tag}: {name} does not match SHA256SUMS")
+    inst, boot = files["install.bin"], files["blimage.bin"]
+    bad = check_install_file(inst)
+    if bad:
+        raise ValueError(f"{release.tag}: {bad}")
+    if not boot or inst[0x500:0x500 + len(boot)] != boot:
+        raise ValueError(f"{release.tag}: install.bin and blimage.bin hold different bootloaders")
+    return inst, boot
+
+
+def download_bootloader(release: BootloaderRelease, cache_dir: Path | None = None) -> tuple[bytes, bytes]:
+    """(install.bin, blimage.bin) of the release, checked; the zip is kept in cache_dir."""
+    sha = _get(release.sha_url)
+    if cache_dir is not None:
+        cached = cache_dir / f"bootloader-{release.tag}.zip"
+        if cached.is_file():
+            try:
+                return check_bootloader_zip(release, cached.read_bytes(), sha)
+            except (ValueError, zipfile.BadZipFile):
+                pass
+    blob = _get(release.zip_url)
+    try:
+        files = check_bootloader_zip(release, blob, sha)
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"{release.tag}: {e}") from e
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"bootloader-{release.tag}.zip").write_bytes(blob)
+    return files
