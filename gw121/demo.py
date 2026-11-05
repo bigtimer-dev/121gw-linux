@@ -149,6 +149,10 @@ class DemoLink(MeterLink):
 
     # ---- commands ----------------------------------------------------------
 
+    @property
+    def card_ready(self) -> bool:
+        return self.is_connected and not self.uploading      # the demo meter takes card requests at any time
+
     def write_frame(self, payload: bytes, done=None) -> None:
         if not self.is_connected:
             if done:
@@ -312,6 +316,10 @@ class DemoSdReceiver:
         self.expect = 0
         self.receiving = False
         self.card: bytes | None = None          # "EEVBlog.bin" after a checked transfer
+        self.files = DemoCard()
+
+    def card_reply(self, t: int, seq: int, payload: bytes) -> bytes:
+        return self.files.handle(t, seq, payload)
 
     @staticmethod
     def _answer(seq: int, status: int, nxt: int) -> bytes:
@@ -326,6 +334,8 @@ class DemoSdReceiver:
         payload = body[4:]
         if crc != _up.crc16(body):
             return self._answer(seq, 1, self.expect)
+        if 0x10 <= ptype <= 0x17:
+            return self.card_reply(ptype, seq, payload)
         if ptype == _up.T_START:
             self.size, self.crc = struct.unpack("<II", payload)
             if not _up.MIN_SIZE <= self.size <= _up.MAX_SIZE:
@@ -357,3 +367,79 @@ class DemoSdReceiver:
             self.card = bytes(self.data)
             return self._answer(seq, 0, 0)
         return self._answer(seq, 3, 0)
+
+
+class DemoCard:
+    """The meter's card and settings requests (ble/bftsd.s, ble/bftset.s) over a few made-up files, for the demo."""
+
+    def __init__(self) -> None:
+        import random
+        rnd = random.Random(121)
+        def log(n: int) -> bytes:
+            rows = ["Time,Value,Unit"] + [f"12:{i // 60:02d}:{i % 60:02d},{5 + rnd.uniform(-.01, .01):.4f},VDC"
+                                          for i in range(n)]
+            return ("\r\n".join(rows) + "\r\n").encode()
+        stamp = ((2026 - 1980) << 9 | 11 << 5 | 5, 14 << 11 | 30 << 5)
+        self.files: dict[str, tuple[bytes, int, int]] = {
+            "cal.bin": (bytes(512), *stamp), "EEVBlog.bin": (bytes(170000), *stamp),
+            "LOG0001.CSV": (log(800), *stamp), "LOG0002.CSV": (log(2500), stamp[0], stamp[1] + 64),
+            "LOG0003.CSV": (log(120), stamp[0], stamp[1] + 128),
+        }
+        self.staged = b""
+        self.settings = {0x00F: 0, 0x010: 1, 0x011: 0, 0x013: 0, 0x014: 3, 0x015: 1, 0x016: 0, 0x017: 31,
+                         0x01A: 13, 0x01B: 0, 0x01E: 1, 0x020: 0, 0x021: 0, 0x022: 10, 0x028: 0, 0x029: 0, 0x02A: 100}
+
+    @staticmethod
+    def reply(seq: int, status: int, field: int = 0, data: bytes = b"") -> bytes:
+        body = struct.pack("<BHBBH", 0x82, seq & 0xFFFF, 3 + len(data), status, field & 0xFFFF) + data
+        return b"\xB5\x5B" + body + struct.pack("<H", _up.crc16(body))
+
+    def _find(self, name: str) -> str | None:
+        return next((k for k in self.files if k.lower() == name.lower()), None)
+
+    def handle(self, t: int, seq: int, p: bytes) -> bytes:
+        if t == 0x10:
+            (start,) = struct.unpack_from("<H", p)
+            names = list(self.files)
+            out, n = b"", 0
+            for name in names[start:]:
+                data, d, tm = self.files[name]
+                e = struct.pack("<IHHBB", len(data), d, tm, 0x20, len(name)) + name.encode()
+                if len(out) + len(e) > 232:
+                    break
+                out += e
+                n += 1
+            return self.reply(seq, 0, n | (0x8000 if start + n >= len(names) else 0), out)
+        if t == 0x11:
+            name = p[1:1 + p[0]].decode("latin-1")
+            off, ln = struct.unpack_from("<IH", p, 1 + p[0])
+            k = self._find(name)
+            if k is None:
+                return self.reply(seq, 0x20)
+            self.staged = self.files[k][0][off:off + ln]
+            return self.reply(seq, 0, len(self.staged), struct.pack("<I", zlib.crc32(self.staged) & 0xFFFFFFFF))
+        if t == 0x12:
+            (idx,) = struct.unpack_from("<H", p)
+            return self.reply(seq, 0, idx, self.staged[idx * 232:(idx + 1) * 232])
+        if t == 0x13:
+            name = p[1:1 + p[0]].decode("latin-1")
+            if name.lower() in ("cal.bin", "eevblog.bin", "btload.tmp"):
+                return self.reply(seq, 0x23)
+            k = self._find(name)
+            if k is None:
+                return self.reply(seq, 0x20)
+            del self.files[k]
+            return self.reply(seq, 0)
+        if t == 0x14:
+            used = sum((len(v[0]) + 32767) // 32768 for v in self.files.values())
+            return self.reply(seq, 0, 64, struct.pack("<II", 242000 - used, 242304))
+        if t == 0x16:
+            return self.reply(seq, 0, len(self.settings), b"".join(struct.pack("<HB", k, v)
+                                                                     for k, v in self.settings.items()))
+        if t == 0x17:
+            wid, v = struct.unpack_from("<HB", p)
+            if wid not in self.settings:
+                return self.reply(seq, 0x22)
+            self.settings[wid] = v
+            return self.reply(seq, 0, wid, bytes([v]))
+        return self.reply(seq, 3)

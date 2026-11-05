@@ -11,6 +11,25 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 
 ## Features
 
+**Card** and **Meter** (zombu4's open firmware `F-1.05` or later, custom `C-1.06` or later)
+
+Put the meter on its SETUP page `Ld-bt` (SETUP, then REL / PEAK to the page after `bt`; logging off). Then:
+- **Card**: lists the files on the meter's SD card with size and date, and the free space. Download a file, delete
+  one (after a confirmation; `cal.bin`, `EEVBlog.bin` and `BTLOAD.TMP` can't be deleted, the meter needs them), or
+  **Sync to Folder**: copies new and changed files into a local folder (default `~/Documents/121GW card`, the
+  **Change…** button picks another). The sync never deletes anything, on either side. Every piece of a file is
+  checked against the CRC-32 the meter computes, and a file is written as `<name>.part` and renamed only when it
+  is complete.
+- **Meter**: the meter's SETUP settings (buzzer, continuity threshold and hold, auto power-off, backlight auto-off,
+  battery trim, LCD contrast, display level, REL view, clock, temperature unit, thermocouple type, dBm reference,
+  current-loop and RTD views, VA burden, Bluetooth rate, logging trigger and change threshold). A change goes to the
+  meter at once; the meter applies and stores it exactly as its own SETUP page does, so the app never writes the
+  EEPROM itself. Calibration, identity and the logging interval are not offered by the firmware.
+- With older firmware the pages say which version is needed.
+
+**Theme**: *Companion Dark* (the default) follows the look of zombu4's 121GW Companion: near-black, warm grey
+text and the meter's yellow as the only accent. *System* (main menu → Theme) uses the desktop's own colours.
+
 **Live**
 - LCD replica: BT, AUTO, 1kHz, 1ms, LowZ, BAT, APO, DC / AC / DC+AC, DIODE, CONT, REL, HOLD,
   MIN / MAX / AVG, MEM, dBm, TEST annunciators, sign, overload (OL)
@@ -210,6 +229,7 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
 |---|---|
 | Settings | `~/.config/121gw/settings.json` |
 | Sessions | `~/.local/share/121gw/sessions.json` |
+| Card files (Download, Sync) | `~/Documents/121GW card` (changeable); `.121gw-sync.json` there records what was copied |
 
 ## Protocol notes
 
@@ -222,6 +242,11 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
   digits (15 bytes, `gw121/keys.py` `clock_payload`). The meter echoes the frame. v2.05 applies the first valid one
   after power-on or after its Bluetooth is switched on; open firmware v1.0.1 and later apply every one (`C-1.02`
   refuses dates and times outside the calendar: no echo).
+- Card and settings (page `Ld`, open firmware `F-1.05` / `C-1.06`+, `gw121/card.py`): requests in the upload's
+  packet framing, types `0x10` LIST, `0x11` READ (up to 8 KB staged in the meter, answered with its CRC-32), `0x12`
+  CHUNK (232 bytes of the staged data), `0x13` DELETE, `0x14` INFO, `0x16` GET and `0x17` PUT of a setting (its
+  EEPROM offset and value). Answers `B5 5B 82 seq(2) len status field(2) data crc16(2)`, one request at a time;
+  answers with damaged first bytes are repaired as for the upload, when their CRC-16 proves it.
 - Version request (open firmware v1.0.1+): `F4 39 30 39 30`; the meter echoes it and answers `F6` + five ASCII
   characters (`C-102`, shown as `C-1.02`) and an XOR byte that makes the XOR of all seven bytes zero
   (`gw121/keys.py` `parse_version_answer`).

@@ -5,10 +5,12 @@ from __future__ import annotations
 import math
 import threading
 from datetime import datetime
+from typing import Callable
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from .chart import TrendChart, export_png, fmt_elapsed, fmt_num
+from .cardview import CardPage, MeterSettingsPage, Worker
 from .continuity import ContinuityEngine
 from .keys import KEYPAD, MeterKey
 from .lcd import LcdView
@@ -120,7 +122,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.stack = Adw.ViewStack()
         self.stack.add_titled_with_icon(self._build_live(), "live", "Live", "utilities-system-monitor-symbolic")
         self.stack.add_titled_with_icon(self._build_sessions(), "sessions", "Sessions", "document-open-recent-symbolic")
+        self.card_worker = Worker(link, self._card_busy)
+        self.card_page = CardPage(self, link, settings, self.card_worker)
+        self.meter_page = MeterSettingsPage(self, link, self.card_worker)
+        self.stack.add_titled_with_icon(self.card_page, "card", "Card", "media-flash-symbolic")
+        self.stack.add_titled_with_icon(self.meter_page, "meter", "Meter", "preferences-system-symbolic")
         self.stack.add_titled_with_icon(self._build_connect(), "connect", "Connect", "bluetooth-symbolic")
+        self.stack.connect("notify::visible-child-name", lambda *_: self._page_shown())
         self.toasts.set_child(self.stack)
 
         header = Adw.HeaderBar()
@@ -131,6 +139,10 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append_submenu("Meter Views", self._views_menu())
         menu.append("Upload Firmware…", "win.upload-firmware")
         menu.append("Check for Firmware Update", "win.check-update")
+        theme_menu = Gio.Menu()
+        theme_menu.append("Companion Dark", "win.theme::companion")
+        theme_menu.append("System", "win.theme::system")
+        menu.append_submenu("Theme", theme_menu)
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("About 121GW", "app.about")
         menu.append("Quit", "app.quit")
@@ -154,7 +166,7 @@ class MainWindow(Adw.ApplicationWindow):
         act = Gio.SimpleAction.new("check-update", None)
         act.connect("activate", lambda *_: self._check_update(manual=True))
         self.add_action(act)
-        for name, key in (("loop-view", "loop_view"), ("rtd-view", "rtd_view")):
+        for name, key in (("loop-view", "loop_view"), ("rtd-view", "rtd_view"), ("theme", "theme")):
             act = Gio.SimpleAction.new_stateful(name, GLib.VariantType.new("s"),
                                                 GLib.Variant.new_string(getattr(self.settings, key)))
             act.connect("change-state", self._on_view_changed, key)
@@ -893,10 +905,30 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_view_changed(self, action: Gio.SimpleAction, value: GLib.Variant, key: str) -> None:
         action.set_state(value)
         setattr(self.settings, key, value.get_string())
+        if key == "theme":
+            from . import theme
+            theme.apply(value.get_string())
+            self.live_chart.queue_draw()
         self.refresh()
 
-    def toast(self, text: str) -> None:
-        self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=3))
+    def toast(self, text: str, action: tuple[str, Callable[[], None]] | None = None) -> None:
+        t = Adw.Toast(title=GLib.markup_escape_text(text), timeout=4 if action else 3)
+        if action:
+            t.set_button_label(action[0])
+            t.connect("button-clicked", lambda *_: action[1]())
+        self.toasts.add_toast(t)
+
+    def _page_shown(self) -> None:
+        name = self.stack.get_visible_child_name()
+        if name == "card":
+            self.card_page.page_shown()
+        elif name == "meter":
+            self.meter_page.page_shown()
+
+    def _card_busy(self, busy: bool) -> None:
+        self.card_page.busy_changed(busy)
+        self.meter_page.busy_changed(busy)
+        self.upload_action.set_enabled(not busy)
 
     # ---- newer custom firmware (gw121/releases.py) ---------------------------
 

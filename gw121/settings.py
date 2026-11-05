@@ -30,7 +30,9 @@ DEFAULTS = {
     "loop_view": "off",           # open firmware LP view mirrored by the app: off / 4-20 / 0-20 (gw121/views.py)
     "rtd_view": "off",            # open firmware Pt view: off / pt100 / pt1000
     "rtd_unit": "°C",             # the meter's temperature unit, learnt from its TEMP readings
-    "check_updates": True,        # look for a newer custom firmware release when the meter runs a C-build
+    "check_updates": True,
+    "theme": "companion",         # "companion" (dark, yellow accent, gw121/theme.py) or "system"
+    "card_folder": None,          # where card files are downloaded and synced (None: ~/Documents/121GW card)        # look for a newer custom firmware release when the meter runs a C-build
 }
 
 
@@ -69,7 +71,8 @@ class Settings:
 
     def normalize_views(self) -> None:
         for key, allowed in (("loop_view", ("off", "4-20", "0-20")), ("rtd_view", ("off", "pt100", "pt1000")),
-                             ("rtd_unit", ("°C", "°F"))):
+                             ("rtd_unit", ("°C", "°F")),
+                             ("theme", ("companion", "system"))):
             if self._data.get(key) not in allowed:
                 self._data[key] = DEFAULTS[key]
 

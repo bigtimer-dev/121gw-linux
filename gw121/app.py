@@ -49,6 +49,8 @@ class App(Adw.Application):
         if self.window is None:
             from .window import MainWindow
             settings = Settings()
+            from . import theme
+            theme.apply(settings.theme)
             if self.demo:
                 from .demo import DemoLink
                 self.link = DemoLink(settings)

@@ -461,8 +461,9 @@ class TrendChart(Gtk.DrawingArea):
 
     def palette(self) -> Palette:
         fg = _rgb(self.get_color())
+        from . import theme
         try:
-            accent = _rgb(Adw.StyleManager.get_default().get_accent_color_rgba())
+            accent = theme.ACCENT_RGB if theme.active else _rgb(Adw.StyleManager.get_default().get_accent_color_rgba())
         except AttributeError:
             accent = (0.21, 0.52, 0.89)
         return Palette(fg=fg, muted=(*fg, 0.6), grid=(*fg, 0.12), accent=accent)

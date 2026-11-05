@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from gi.repository import GLib
 
 from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
 from .packet import FrameAssembler, PacketV2
+from .card import TIMEOUT_MS, CardError, ReplyParser, repair_reply, request_packet
 from .setup_pages import SetupText, parse_setup_frames
 from .upload import (BOOTLOADER_INFO_REQUEST, PROBE_SEQ, T_DATA, UPDATE_MODE_REQUEST, AnswerParser, BootSession,
                      UploadSession, has_direct_update, image_version, parse_bootloader_answer, probe_packet,
@@ -106,6 +108,13 @@ class MeterLink:
         self._upload_t0 = 0.0
         self._upload_progress: Callable[[float, int, int, float], None] | None = None
         self._upload_done: Callable[[bool, str], None] | None = None
+        # card files and settings over page Ld (open firmware v1.0.5+ / C-1.06+, gw121/card.py): one request at a time
+        self.card_busy = False          # a card operation runs: no Ld probes meanwhile (the meter is deaf on the card)
+        self._card_seq = 0x4000
+        self._card_wait: dict | None = None
+        self._card_parser = ReplyParser()
+        self._card_raw = bytearray()
+        self._card_lock = threading.Lock()
 
     # ---- observers ---------------------------------------------------------
 
@@ -167,6 +176,9 @@ class MeterLink:
         now = time.monotonic()
         if not self.is_connected or self._upload is not None or self._boot is not None:
             return
+        if self.card_busy:
+            self._probe_answer_at = now             # the card answers stand in for the probe
+            return
         waiting = self._boot_job is not None    # waiting for the update mode: ask at once and often
         quiet_since = self._last_packet_at if self._last_packet_at is not None else self._connected_at
         if quiet_since is None or now - quiet_since < (0.5 if waiting else self.PROBE_AFTER):
@@ -194,6 +206,8 @@ class MeterLink:
         return GLib.SOURCE_CONTINUE
 
     def ingest(self, data: bytes) -> None:
+        if self._card_wait is not None:
+            self._card_answers(data)
         if self._upload is not None:
             self._answers(self._upload, self._upload_parser, data, self._upload_answer)
         elif self._boot is not None:
@@ -424,6 +438,58 @@ class MeterLink:
         self._clock_tail.clear()
         if cb is not None and text:
             cb(text)
+
+    # ---- card files and settings (page Ld, open firmware v1.0.5+ / C-1.06+) ---
+
+    @property
+    def card_ready(self) -> bool:
+        """The meter takes card and settings requests now (page Ld shown, no transfer running)."""
+        return self.is_connected and self.on_ld_page and not self.uploading
+
+    def card_request(self, rtype: int, payload: bytes = b"") -> tuple[int, int, bytes]:
+        """Send one request and wait for its answer: (status, field, data). Called from a worker thread only;
+        raises CardError (status None) when no answer came in time."""
+        with self._card_lock:
+            ev = threading.Event()
+            box: dict = {"ev": ev, "result": None}
+
+            def send() -> bool:
+                if not self.is_connected:
+                    ev.set()
+                    return GLib.SOURCE_REMOVE
+                self._card_seq = 0x4000 | ((self._card_seq + 1) & 0x1FFF)
+                box["seq"] = self._card_seq
+                self._card_parser.clear()
+                self._card_raw.clear()
+                self._card_wait = box
+                self._write_pieces(request_packet(rtype, self._card_seq, payload), None)
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(send)
+            ev.wait(TIMEOUT_MS.get(rtype, 8000) / 1000)
+            GLib.idle_add(lambda: (setattr(self, "_card_wait", None) if self._card_wait is box else None,
+                                   GLib.SOURCE_REMOVE)[1])
+            if box["result"] is None:
+                raise CardError("no answer from the meter (is Ld-bt still shown on it?)")
+            return box["result"]
+
+    def _card_answers(self, data: bytes) -> None:
+        box = self._card_wait
+        raw = self._card_raw
+        raw += data
+        if len(raw) > 300:
+            del raw[:-300]
+        got = [a for a in self._card_parser.feed(data) if a[0] == box.get("seq")]
+        if not got:
+            fixed = repair_reply(bytes(raw), box.get("seq", -1))
+            if fixed is None:
+                return
+            self.answers_repaired += 1
+            got = [fixed]
+        self._probe_answer_at = time.monotonic()
+        box["result"] = got[0][1:]
+        self._card_wait = None
+        box["ev"].set()
 
     # ---- firmware upload (open firmware v1.0.0+, SETUP page Ld) ------------
 
