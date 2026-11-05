@@ -346,3 +346,13 @@ class BootLinkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BootloaderKindTests(unittest.TestCase):
+    def test_start_payload_for_bootloader_image(self):
+        import struct as _s
+        s = U.BootSession(b"x" * 300, U.KIND_BOOTLOADER, 0x010102)
+        pkt = s.to_send()[0]
+        size, crc, kind, ver = _s.unpack_from("<IIBI", pkt, 6)
+        self.assertEqual((size, kind, ver), (300, 2, 0x010102))
+        self.assertEqual(len(U.BootSession(b"x" * 300).to_send()[0]), 8 + 9)

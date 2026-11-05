@@ -263,6 +263,7 @@ def probe_result(status: int, nxt: int) -> str | None:
 BOOTLOADER_INFO_REQUEST = bytes([0xF4, 0x39, 0x32, 0x39, 0x32])     # key code 0x92
 UPDATE_MODE_REQUEST = bytes([0xF4, 0x39, 0x31, 0x39, 0x31])         # key code 0x91
 KIND_FIRMWARE = 0
+KIND_BOOTLOADER = 2                 # zombu4's bootloader image (blimage.bin) into the bootloader's spare slot
 BOOT_WINDOW = 2
 BOOT_TIMEOUT_START_MS = 30_000     # the bootloader erases the firmware before it answers START
 BOOT_TIMEOUT_DATA_MS = 3_000
@@ -305,8 +306,10 @@ class BootSession:
     every packet in order and only takes the packet it expects, so a status 2 names where to go on from; a packet sent
     again is sent once per position (later status 2 answers for it come from packets already in flight)."""
 
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, kind: int = KIND_FIRMWARE, version: int | None = None) -> None:
         self.data = bytes(data)
+        self.kind = kind
+        self.version = version        # the bootloader's A << 16 | B << 8 | C, sent with a bootloader image
         self.chunks = [self.data[i:i + MAX_PAYLOAD] for i in range(0, len(self.data), MAX_PAYLOAD)]
         self.phase = "start"
         self.acked = 0                # DATA packets the meter has taken
@@ -352,7 +355,10 @@ class BootSession:
                 return []
             self._sent_phase = True
             crc = zlib.crc32(self.data) & 0xFFFFFFFF
-            return [packet(T_START, 0, struct.pack("<IIB", len(self.data), crc, KIND_FIRMWARE))]
+            start = struct.pack("<IIB", len(self.data), crc, self.kind)
+            if self.version is not None:
+                start += struct.pack("<I", self.version)
+            return [packet(T_START, 0, start)]
         if self.phase == "end":
             if self._sent_phase:
                 return []

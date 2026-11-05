@@ -607,7 +607,8 @@ class MeterLink:
     # ---- direct firmware update through zombu4's bootloader ----------------
 
     def install_firmware(self, data: bytes, on_progress: Callable[[float, int, int, float], None],
-                         on_done: Callable[[bool, str], None], on_state: Callable[[str], None] | None = None) -> None:
+                         on_done: Callable[[bool, str], None], on_state: Callable[[str], None] | None = None,
+                         kind: int = 0, version: int | None = None) -> None:
         """Write a firmware image straight into the meter's flash: restart into the bootloader's update mode (0x91)
         unless it is there, then the bootloader's transfer. The meter restarts into the new firmware afterwards."""
         if not self.is_connected:
@@ -617,7 +618,8 @@ class MeterLink:
         if self._boot_job is not None:
             self._boot_finish(False, "Replaced by a new update")
         self._boot_job = {"data": bytes(data), "progress": on_progress, "done": on_done, "state": on_state,
-                          "asked_at": time.monotonic(), "dropped": False, "version": image_version(data)}
+                          "asked_at": time.monotonic(), "dropped": False,
+                          "version": image_version(data) if kind == 0 else None, "kind": kind, "bl_version": version}
         if self._boot_prev_auto is None and self.settings is not None:
             self._boot_prev_auto = bool(getattr(self.settings, "auto_reconnect", True))
             self.set_auto_reconnect(True)           # the meter restarts: the link has to come back by itself
@@ -645,7 +647,7 @@ class MeterLink:
         if self._boot_wait_timer:
             GLib.source_remove(self._boot_wait_timer)
             self._boot_wait_timer = 0
-        self._boot = BootSession(job["data"])
+        self._boot = BootSession(job["data"], job.get("kind", 0), job.get("bl_version"))
         self._boot_parser.clear()
         self._answer_raw.clear()
         self._boot_tx.clear()
