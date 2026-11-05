@@ -66,6 +66,14 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
   meter's serial line (19200 baud) limits any setting to about 1½ minutes. Every upload, slow or not, ended with the
   meter's own check (length, CRC-32, image header, copy read back): a lost packet costs time, not data.
 
+  **Damaged answers (fixed in the app).** At short intervals the meter's Bluetooth module damages some of the meter's
+  answers on its serial input: a one-bit slip in one of the first bytes (`5B` -> `2B`, `81` -> `60`, the packet number
+  `0x20` -> `0x10`), while the meter had taken the packet. A capture at 7.5 ms showed about 1 answer in 6 damaged and
+  no packet to the meter damaged at all; each damaged answer used to cost a 3 s wait. The app now repairs such an
+  answer when its CRC-16 matches with the header and the awaited packet number put back (`repair_answer`). Measured
+  2026-11-05 at 7.5 ms (`MinInterval=6`, `MaxInterval=6`): the 170 KB C-1.04 image in 3 minutes (982 B/s), 74 answers
+  repaired, 2 packets sent again. That is zombu4's speed (155 kB in 160–170 s).
+
   On 2026-11-05 a capture showed 45 ms again on a later connection although the file still held the setting, so
   BlueZ may not apply it every time. `MinConnectionInterval=12` / `MaxConnectionInterval=12` in
   `/etc/bluetooth/main.conf` sets 15 ms for every LE device that doesn't ask for its own timing.

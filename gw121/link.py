@@ -16,7 +16,7 @@ from .packet import FrameAssembler, PacketV2
 from .setup_pages import SetupText, parse_setup_frames
 from .upload import (BOOTLOADER_INFO_REQUEST, PROBE_SEQ, T_DATA, UPDATE_MODE_REQUEST, AnswerParser, BootSession,
                      UploadSession, has_direct_update, image_version, parse_bootloader_answer, probe_packet,
-                     probe_result)
+                     probe_result, repair_answer)
 
 COMM_TIMEOUT = 5.0
 BATTERY_LOW_V = 4.5
@@ -99,6 +99,8 @@ class MeterLink:
         self._probe_answer_at = 0.0
         self._upload: UploadSession | None = None
         self._upload_parser = AnswerParser()
+        self._answer_raw = bytearray()  # recent bytes during a transfer, for repair_answer
+        self.answers_repaired = 0
         self._upload_timer = 0
         self._pieces_gen = 0            # bumped to drop the rest of a packet being written in pieces
         self._upload_t0 = 0.0
@@ -193,11 +195,9 @@ class MeterLink:
 
     def ingest(self, data: bytes) -> None:
         if self._upload is not None:
-            for a in self._upload_parser.feed(data):
-                self._upload_answer(*a)
+            self._answers(self._upload, self._upload_parser, data, self._upload_answer)
         elif self._boot is not None:
-            for a in self._boot_parser.feed(data):
-                self._boot_answer(*a)
+            self._answers(self._boot, self._boot_parser, data, self._boot_answer)
         elif self._probe_at:
             for seq, status, nxt in self._probe_parser.feed(data):
                 if seq & 0xFF00 == PROBE_SEQ:
@@ -212,6 +212,25 @@ class MeterLink:
         packets = self._assembler.feed(data)
         if packets:
             self._publish(packets[-1])
+
+    def _answers(self, session, parser: AnswerParser, data: bytes, handle) -> None:
+        """The meter's answers to transfer packets; an answer with damaged first bytes is repaired when its CRC-16
+        proves it (repair_answer)."""
+        raw = self._answer_raw
+        raw += data
+        if len(raw) > 48:
+            del raw[:-48]
+        got = parser.feed(data)
+        if got:
+            raw.clear()
+            for a in got:
+                handle(*a)
+            return
+        fixed = repair_answer(bytes(raw), session.expected_seqs())
+        if fixed is not None:
+            raw.clear()
+            self.answers_repaired += 1
+            handle(*fixed)
 
     def _probe_answered(self, status: int, nxt: int) -> None:
         self._probe_answer_at = time.monotonic()
@@ -421,6 +440,7 @@ class MeterLink:
         self.cancel_upload()
         self._upload = UploadSession(data)
         self._upload_parser.clear()
+        self._answer_raw.clear()
         self._upload_progress, self._upload_done = on_progress, on_done
         self._upload_t0 = time.monotonic()
         self._upload_send()
@@ -561,6 +581,7 @@ class MeterLink:
             self._boot_wait_timer = 0
         self._boot = BootSession(job["data"])
         self._boot_parser.clear()
+        self._answer_raw.clear()
         self._boot_tx.clear()
         job["t0"] = time.monotonic()
         self._boot_state(f"Update mode ({self.update_mode}): erasing the firmware…")

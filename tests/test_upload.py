@@ -70,6 +70,48 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parser.feed(bytes(bad)), [])
 
 
+class RepairTests(unittest.TestCase):
+    """Answers as a real 121GW's Bluetooth module damaged them at a 7.5 ms interval (btmon, 2026-11-05)."""
+
+    DAMAGED = [
+        ("b5 2b 81 01 00 03 00 02 00 48 5a", 1, (1, 0, 2)),       # 5B -> 2B
+        ("b5 56 81 03 00 03 00 04 00 ae 7b", 3, (3, 0, 4)),       # 5B -> 56
+        ("b5 5b 60 15 00 03 00 16 00 da 89", 21, (21, 0, 22)),    # 81 -> 60
+        ("b5 5b 81 10 00 03 00 21 00 55 79", 32, (32, 0, 33)),    # packet number 0x20 -> 0x10
+        ("b5 5b 81 07 80 03 00 08 00 62 38", 7, (7, 0, 8)),       # high byte 00 -> 80
+    ]
+
+    def test_real_damaged_answers(self):
+        for hexa, expect, want in self.DAMAGED:
+            raw = bytes.fromhex(hexa)
+            self.assertEqual(U.AnswerParser().feed(raw), [], hexa)               # the strict parser drops them
+            self.assertEqual(U.repair_answer(raw, [expect]), want, hexa)
+
+    def test_no_repair_without_proof(self):
+        raw = bytearray.fromhex("b5 2b 81 01 00 03 00 02 00 48 5a")
+        raw[8] ^= 1                                                              # "next" damaged too: CRC fails
+        self.assertIsNone(U.repair_answer(bytes(raw), [1]))
+        self.assertIsNone(U.repair_answer(bytes.fromhex("f2 17 80 00 00 09 86 fd f2 64 01 01 37 01 19"), [5]))
+
+    def test_link_takes_a_repaired_answer(self):
+        link, data = FakeLink(), image(3000)
+        n = [0]
+        orig = link.meter.packet
+
+        def damaging(p):
+            a = orig(p)
+            n[0] += 1
+            if a and n[0] % 3 == 0:
+                a = a[:1] + bytes([0x2B]) + a[2:]                                # every third answer damaged
+            return a
+        link.meter.packet = damaging
+        result = []
+        link.upload_firmware(data, lambda *_: None, lambda ok, t: result.append((ok, t)))
+        self.assertEqual(result and result[0][0], True, result)
+        self.assertEqual(link.meter.card, data)
+        self.assertGreater(link.answers_repaired, 3)
+
+
 class SessionTests(unittest.TestCase):
     def test_clean_transfer(self):
         data, meter = image(), DemoSdReceiver()

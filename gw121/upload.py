@@ -106,6 +106,23 @@ class AnswerParser:
                 del self.buf[: i + 1]
 
 
+def repair_answer(buf: bytes, expected: list[int]) -> tuple[int, int, int] | None:
+    """An answer whose first bytes the meter's Bluetooth module damaged, recovered from buf.
+
+    On a real 121GW at a 7.5 ms connection interval about 1 in 6 answers arrives with one of its first bytes damaged
+    (a one-bit slip on the module's serial input: 5B -> 2B or 56, 81 -> 60, the packet number 0x20 -> 0x10), while
+    the meter had taken the packet. The rest (length, status, next, CRC-16) arrives intact. With the header and the
+    awaited packet number put back, a matching CRC-16 proves the answer; nothing is guessed beyond that."""
+    for i in range(len(buf) - 11, -1, -1):
+        w = buf[i:i + 11]
+        crc = int.from_bytes(w[9:11], "little")
+        for seq in [int.from_bytes(w[3:5], "little"), *expected]:
+            body = struct.pack("<BHB", 0x81, seq & 0xFFFF, 3) + w[6:9]
+            if crc16(body) == crc:
+                return seq, w[6], int.from_bytes(w[7:9], "little")
+    return None
+
+
 @dataclass
 class Step:
     packet: bytes
@@ -193,6 +210,9 @@ class UploadSession:
             self.message = ("EEVBlog.bin is on the meter's SD card and verified. To install it: switch the meter off, "
                             "hold MEM + HOLD while switching it on, then press SETUP.")
         return True
+
+    def expected_seqs(self) -> list[int]:
+        return [] if self.done else [self.step().seq]
 
     def timeout(self) -> bool:
         """No answer in time: True to send step() again, False when the session has failed."""
@@ -314,6 +334,15 @@ class BootSession:
     @property
     def fraction(self) -> float:
         return self.sent_bytes / len(self.data) if self.data else 0.0
+
+    def expected_seqs(self) -> list[int]:
+        if self.done:
+            return []
+        if self.phase == "start":
+            return [0]
+        if self.phase == "end":
+            return [len(self.chunks)]
+        return list(range(self.acked, max(self.next_send, self.acked + 1)))
 
     def to_send(self) -> list[bytes]:
         if self.done:
