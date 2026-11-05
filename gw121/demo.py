@@ -334,7 +334,7 @@ class DemoSdReceiver:
         payload = body[4:]
         if crc != _up.crc16(body):
             return self._answer(seq, 1, self.expect)
-        if 0x10 <= ptype <= 0x17:
+        if 0x10 <= ptype <= (0x19 if self.files.fast else 0x17):
             return self.card_reply(ptype, seq, payload)
         if ptype == _up.T_START:
             self.size, self.crc = struct.unpack("<II", payload)
@@ -371,6 +371,8 @@ class DemoSdReceiver:
 
 class DemoCard:
     """The meter's card and settings requests (ble/bftsd.s, ble/bftset.s) over a few made-up files, for the demo."""
+
+    fast = True                         # STREAM (C-1.07 on); False answers like C-1.06
 
     def __init__(self) -> None:
         import random
@@ -421,6 +423,20 @@ class DemoCard:
         if t == 0x12:
             (idx,) = struct.unpack_from("<H", p)
             return self.reply(seq, 0, idx, self.staged[idx * 232:(idx + 1) * 232])
+        if t == 0x18:
+            return self.reply(seq, 0, 218)
+        if t == 0x19:                                               # STREAM (ble/bftfast.s, C-1.07 on)
+            first, count, size = struct.unpack_from("<HHB", p)
+            n = (len(self.staged) + size - 1) // size - first if size else 0
+            if not 1 <= size <= 232 or n <= 0:
+                return self.reply(seq, 0x22)
+            count = min(count, n)
+            out = self.reply(seq, 0, count)
+            for i in range(first, first + count):
+                d = self.staged[i * size:(i + 1) * size]
+                body = struct.pack("<BHB", 0x83, i, len(d)) + d
+                out += b"\xB5\x5B" + body + struct.pack("<H", _up.crc16(body))
+            return out
         if t == 0x13:
             name = p[1:1 + p[0]].decode("latin-1")
             if name.lower() in ("cal.bin", "eevblog.bin", "btload.tmp"):

@@ -14,7 +14,8 @@ from gi.repository import GLib
 
 from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
 from .packet import FrameAssembler, PacketV2
-from .card import TIMEOUT_MS, CardError, ReplyParser, repair_reply, request_packet
+from .card import (T_STREAM, TIMEOUT_MS, CardError, ReplyParser, StreamParser, repair_reply, request_packet,
+                   stream_payload)
 from .setup_pages import SetupText, parse_setup_frames
 from .upload import (BOOTLOADER_INFO_REQUEST, PROBE_SEQ, T_DATA, UPDATE_MODE_REQUEST, AnswerParser, BootSession,
                      UploadSession, has_direct_update, image_version, parse_bootloader_answer, probe_packet,
@@ -35,6 +36,16 @@ class DiscoveredDevice:
     rssi: int | None = None
     is_meter: bool = True
     connected: bool = False
+
+
+CARD_GAP_MS = 80                    # at least this long without a byte after part of a card answer (or 3 x the spacing of
+                                    # its pieces): it arrived damaged
+
+
+def _is_meter_frame(data: bytes) -> bool:
+    """A whole reading frame (19 bytes, 0xF2) or a short answer of the key / version parser, not part of a card answer."""
+    return (len(data) == 19 and data[0] == 0xF2) or (len(data) <= 11 and data[:1] in (b"\xF4", b"\xF6", b"\xF7",
+                                                                                       b"\xFA"))
 
 
 class MeterLink:
@@ -109,9 +120,11 @@ class MeterLink:
         self._upload_progress: Callable[[float, int, int, float], None] | None = None
         self._upload_done: Callable[[bool, str], None] | None = None
         # card files and settings over page Ld (open firmware v1.0.5+ / C-1.06+, gw121/card.py): one request at a time
+        self.card_damaged = 0           # card answers that arrived damaged and were asked again
         self.card_busy = False          # a card operation runs: no Ld probes meanwhile (the meter is deaf on the card)
         self._card_seq = 0x4000
         self._card_wait: dict | None = None
+        self._card_stream: dict | None = None      # a STREAM being received (card_stream)
         self._card_parser = ReplyParser()
         self._card_raw = bytearray()
         self._card_lock = threading.Lock()
@@ -206,7 +219,16 @@ class MeterLink:
         return GLib.SOURCE_CONTINUE
 
     def ingest(self, data: bytes) -> None:
-        if self._card_wait is not None:
+        box = self._card_stream
+        if box is not None:
+            for item in box["parser"].feed(data):
+                if item[0] == "piece":
+                    box["pieces"][item[1]] = item[2]
+                elif item[1] == box.get("seq") and box["status"] is None:
+                    box["status"], box["field"] = item[2], item[3]
+            if not _is_meter_frame(data):
+                box["last"] = time.monotonic()
+        elif self._card_wait is not None:
             self._card_answers(data)
         if self._upload is not None:
             self._answers(self._upload, self._upload_parser, data, self._upload_answer)
@@ -467,11 +489,52 @@ class MeterLink:
 
             GLib.idle_add(send)
             ev.wait(TIMEOUT_MS.get(rtype, 8000) / 1000)
+            if box.get("damaged"):
+                raise CardError("the answer arrived damaged", raw=box.get("raw"))   # asked again, copies combined
             GLib.idle_add(lambda: (setattr(self, "_card_wait", None) if self._card_wait is box else None,
                                    GLib.SOURCE_REMOVE)[1])
             if box["result"] is None:
                 raise CardError("no answer from the meter (is Ld-bt still shown on it?)")
             return box["result"]
+
+    STREAM_IDLE_S = 0.6             # no byte for this long: the stream is over (pieces come every 10 ms)
+    STREAM_FIRST_S = 3.0            # wait this long for the first byte of a stream
+
+    def card_stream(self, first: int, count: int, size: int) -> tuple[int | None, int, dict[int, bytes]]:
+        """STREAM pieces first .. first + count - 1 of the staged READ data: (status or None if no answer came, field,
+        {index: data}) with every piece that arrived intact. Called from a worker thread only."""
+        with self._card_lock:
+            box: dict = {"parser": StreamParser(), "pieces": {}, "status": None, "field": count, "last": None}
+            ready = threading.Event()
+
+            def send() -> bool:
+                if self.is_connected:
+                    self._card_seq = 0x4000 | ((self._card_seq + 1) & 0x1FFF)
+                    box["seq"] = self._card_seq
+                    box["t0"] = time.monotonic()
+                    self._card_stream = box
+                    self._write_pieces(request_packet(T_STREAM, self._card_seq, stream_payload(first, count, size)),
+                                       None)
+                ready.set()
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(send)
+            ready.wait(5)
+            try:
+                while self._card_stream is box and self.is_connected:
+                    now = time.monotonic()
+                    want = box["field"] if box["status"] == 0 else count
+                    if box["status"] not in (None, 0) or len(box["pieces"]) >= want:
+                        break
+                    last = box["last"]
+                    if (last is None and now - box["t0"] > self.STREAM_FIRST_S) or \
+                            (last is not None and now - last > self.STREAM_IDLE_S):
+                        break
+                    time.sleep(0.05)
+            finally:
+                GLib.idle_add(lambda: (setattr(self, "_card_stream", None) if self._card_stream is box else None,
+                                       GLib.SOURCE_REMOVE)[1])
+            return box["status"], box["field"], dict(box["pieces"])
 
     def _card_answers(self, data: bytes) -> None:
         box = self._card_wait
@@ -483,13 +546,46 @@ class MeterLink:
         if not got:
             fixed = repair_reply(bytes(raw), box.get("seq", -1))
             if fixed is None:
+                # bytes came but no answer passes its CRC: the meter sends an answer in one go (indications 15 ms
+                # apart), so a pause after them means it was damaged on the way; ask again instead of waiting for the
+                # timeout (the meter's Bluetooth module flips bits, measured: 2 of 6 answers on 2026-11-05)
+                if _is_meter_frame(data):                # readings and other frames don't hold the answer back
+                    return
+                if box.get("gap_timer"):
+                    GLib.source_remove(box["gap_timer"])
+                    box["gap_timer"] = 0
+                start = raw.find(0xB5)
+                if 0 <= start and len(raw) - start >= 8 and len(raw) - start >= 8 + raw[start + 5]:
+                    self._card_gap(box)                 # all of it is here (by its length byte): damaged
+                    return
+                now = time.monotonic()
+                last = box.get("last_piece")
+                if last is not None:
+                    box["spacing"] = max(box.get("spacing", 0.0), now - last)
+                box["last_piece"] = now
+                wait = max(CARD_GAP_MS, int(3000 * box.get("spacing", 0.0)))
+                box["gap_timer"] = GLib.timeout_add(wait, self._card_gap, box)
                 return
             self.answers_repaired += 1
             got = [fixed]
+        if box.get("gap_timer"):
+            GLib.source_remove(box.pop("gap_timer"))
         self._probe_answer_at = time.monotonic()
         box["result"] = got[0][1:]
         self._card_wait = None
         box["ev"].set()
+
+    def _card_gap(self, box: dict) -> bool:
+        if box.get("gap_timer"):
+            GLib.source_remove(box["gap_timer"])
+        box.pop("gap_timer", None)
+        if self._card_wait is box and box["result"] is None and 0x82 in self._card_raw:
+            self._card_wait = None
+            box["damaged"] = True
+            box["raw"] = bytes(self._card_raw)
+            self.card_damaged += 1
+            box["ev"].set()
+        return GLib.SOURCE_REMOVE
 
     # ---- firmware upload (open firmware v1.0.0+, SETUP page Ld) ------------
 

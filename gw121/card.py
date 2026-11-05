@@ -38,6 +38,7 @@ from .upload import crc16, packet
 
 T_LIST, T_READ, T_CHUNK, T_DELETE, T_INFO, T_GET, T_PUT = 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17
 T_ANSWER = 0x82
+T_LINK, T_STREAM, T_PIECE = 0x18, 0x19, 0x83     # fast reads (custom firmware C-1.07 on, CF-08)
 CHUNK = 232
 WINDOW = 8192
 MAX_NAME = 63
@@ -58,9 +59,10 @@ _NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 
 
 class CardError(RuntimeError):
-    def __init__(self, text: str, status: int | None = None) -> None:
+    def __init__(self, text: str, status: int | None = None, raw: bytes | None = None) -> None:
         super().__init__(text)
         self.status = status
+        self.raw = raw              # the bytes of an answer that arrived damaged (for combine_copies)
 
 
 def describe(status: int, field: int = 0) -> str:
@@ -106,6 +108,42 @@ class ReplyParser:
                 del self.buf[:1]
 
 
+class StreamParser:
+    """Answers and stream pieces out of the received bytes: ("answer", seq, status, field, data) for type 0x81 / 0x82
+    (a 0x81 answer is how firmware without STREAM refuses it: status 3), ("piece", idx, data) for type 0x83."""
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def feed(self, data: bytes) -> list[tuple]:
+        self.buf += data
+        out: list[tuple] = []
+        while True:
+            i = self.buf.find(b"\xB5\x5B")
+            if i < 0:
+                del self.buf[:-1]
+                return out
+            del self.buf[:i]
+            if len(self.buf) < 6:
+                return out
+            kind, n = self.buf[2], self.buf[5]
+            if kind not in (0x81, T_ANSWER, T_PIECE) or (kind != T_PIECE and n < 3):
+                del self.buf[:1]
+                continue
+            if len(self.buf) < 8 + n:
+                return out
+            body = bytes(self.buf[2:6 + n])
+            if crc16(body) != int.from_bytes(self.buf[6 + n:8 + n], "little"):
+                del self.buf[:1]
+                continue
+            del self.buf[:8 + n]
+            num = int.from_bytes(body[1:3], "little")
+            if kind == T_PIECE:
+                out.append(("piece", num, body[4:]))
+            else:
+                out.append(("answer", num, body[4], int.from_bytes(body[5:7], "little"), body[7:]))
+
+
 def repair_reply(buf: bytes, seq: int) -> tuple[int, int, int, bytes] | None:
     """An answer to request `seq` whose first bytes the meter's Bluetooth module damaged (as upload.repair_answer):
     accepted only when its CRC-16 matches with the header and the sequence number put back."""
@@ -118,6 +156,53 @@ def repair_reply(buf: bytes, seq: int) -> tuple[int, int, int, bytes] | None:
             body = struct.pack("<BHB", T_ANSWER, s & 0xFFFF, n) + rest
             if crc16(body) == int.from_bytes(buf[i + 6 + n:i + 8 + n], "little") and s == seq:
                 return s, rest[0], int.from_bytes(rest[1:3], "little"), bytes(rest[3:])
+    return None
+
+
+def combine_copies(frames: list[bytes], max_tries: int = 16) -> tuple[int, int, int, bytes] | None:
+    """One good answer out of several damaged copies of the same answer (asked again with new sequence numbers).
+
+    The meter's Bluetooth module damages bytes of most longer answers, about one in 35, at random places (measured
+    2026-11-05 on the real meter: every 111-byte CHUNK answer, 2..4 bytes in a 104-byte LIST answer). Copies of one
+    length are voted byte by byte; where no value has a majority, the values seen there are tried (at most max_tries
+    mixes). A result counts only when its CRC-16 matches together with one copy's own sequence number and CRC, so a
+    wrong vote does not pass (and file data is checked against the meter's CRC-32 as well)."""
+    by_len: dict[int, list[bytes]] = {}
+    for f in frames:
+        if len(f) >= 11:
+            by_len.setdefault(len(f), []).append(f)
+    for size, group in sorted(by_len.items(), key=lambda kv: -len(kv[1])):
+        if len(group) < 2:
+            continue
+        n = size - 8
+        bodies = [f[6:size - 2] for f in group]                       # status, field, data
+        vote = bytearray(bodies[0])
+        open_pos: list[tuple[int, list[int]]] = []
+        for i in range(len(vote)):
+            vals = [b[i] for b in bodies]
+            if len(set(vals)) == 1:
+                continue
+            counts = {v: vals.count(v) for v in set(vals)}
+            top = max(counts.values())
+            best = sorted(v for v, c in counts.items() if c == top)
+            vote[i] = best[0]
+            if len(best) > 1:
+                open_pos.append((i, best))
+        total = 1
+        for _, vals in open_pos:
+            total *= len(vals)
+        if total > max_tries:
+            continue
+        tails = {(f[3:5], f[size - 2:]) for f in group}
+        for k in range(total):
+            for i, vals in open_pos:
+                vote[i] = vals[k % len(vals)]
+                k //= len(vals)
+            for seq_b, crc_b in tails:
+                body = bytes([T_ANSWER]) + seq_b + bytes([n]) + bytes(vote)
+                if crc16(body) == int.from_bytes(crc_b, "little"):
+                    return (int.from_bytes(seq_b, "little"), vote[0], int.from_bytes(vote[1:3], "little"),
+                            bytes(vote[3:]))
     return None
 
 
@@ -158,6 +243,10 @@ def delete_payload(name: str) -> bytes:
 
 def put_payload(wire_id: int, value: int) -> bytes:
     return struct.pack("<HB", wire_id, value)
+
+
+def stream_payload(first: int, count: int, size: int = CHUNK) -> bytes:
+    return struct.pack("<HHB", first, count, size)
 
 
 def request_packet(rtype: int, seq: int, payload: bytes = b"") -> bytes:
@@ -303,21 +392,45 @@ def wire_value(s: Setting, value: int, raw: dict[int, int]) -> int:
 # ---- the operations (worker thread) -----------------------------------------------------------------------------
 
 Request = Callable[[int, bytes], "tuple[int, int, bytes]"]     # (type, payload) -> (status, field, data); raises
+# (first, count, size) -> (status or None when no answer came, field, {piece index: data})
+Stream = Callable[[int, int, int], "tuple[int | None, int, dict[int, bytes]]"]
 
 
 class CardClient:
     """Card and settings operations; `request` sends one request and returns its answer or raises CardError."""
 
-    RETRIES = 4
-    CHUNK_RETRIES = 8
+    RETRIES = 10
+    # bytes per READ: the meter's Bluetooth module loses bytes of answers above about 130 bytes (its buffer overflows:
+    # the meter sends at 19200 baud, faster than the module forwards), measured 2026-11-05: 111-byte answers all
+    # complete, 151 bytes and more none; so one CHUNK answer of at most 100 data bytes per READ
+    window = 100
+    CHUNK_RETRIES = 12
     WINDOW_TRIES = 3
+    WINDOW_ROUNDS = 5                # fresh rounds for one piece after a streak of damaged answers
 
-    def __init__(self, request: Request, cancelled: Callable[[], bool] = lambda: False) -> None:
+    FAST_WINDOW = 8192               # bytes per READ with STREAM (the meter's staging buffer)
+    # The meter's Bluetooth module sends one 20-byte indication per confirmation, i.e. per two connection events:
+    # 1330 bytes/s at 7.5 ms, 660 at 15 ms (the adapter picks 15 ms while something scans for devices, measured
+    # 2026-11-05). Pace 13 (the firmware's default, with an idle frame every 2 bytes) needs the 7.5 ms interval;
+    # when a stream loses pieces the pace is lowered (LINK) so the module is not overrun.
+    PACES = (13, 6, 3)
+    STREAM_ROUNDS = 4                # STREAM again for pieces that did not arrive, then CHUNK for the rest
+
+    def __init__(self, request: Request, cancelled: Callable[[], bool] = lambda: False,
+                 stream: Stream | None = None) -> None:
         self._request = request
         self.cancelled = cancelled
+        self._stream = stream
+        # STREAM support: None not known yet, True the firmware streams (C-1.07 on: paced, idle gaps, measured
+        # 1192 bytes/s without a damaged byte), False it does not (C-1.06, zombu4's firmware: 100-byte CHUNKs)
+        self.fast: bool | None = None if stream else False
+        self.combined = 0           # answers put together from damaged copies
+        self.streamed = 0           # pieces that arrived by STREAM
+        self.pace = self.PACES[0]   # bytes per 10 ms the meter sends (LINK); lowered when pieces get lost
 
     def _ask(self, rtype: int, payload: bytes = b"", retries: int | None = None) -> tuple[int, int, bytes]:
-        last = None
+        """Ask until an answer passes its CRC-16; damaged copies of the answer are combined (combine_copies)."""
+        last, copies = None, []
         for _ in range(retries or self.RETRIES):
             if self.cancelled():
                 raise CardError("cancelled")
@@ -327,6 +440,13 @@ class CardClient:
                 if e.status is not None:
                     raise
                 last = e
+                if e.raw:
+                    copies.append(e.raw)
+                    if len(copies) >= 2:
+                        got = combine_copies(copies)
+                        if got is not None:
+                            self.combined += 1
+                            return got[1:]
         raise last or CardError("no answer")
 
     def _ok(self, rtype: int, payload: bytes = b"") -> tuple[int, bytes]:
@@ -374,15 +494,12 @@ class CardClient:
         buf = bytearray()
         for idx in range((n + CHUNK - 1) // CHUNK):
             want = min(CHUNK, n - idx * CHUNK)
-            for _ in range(self.CHUNK_RETRIES):
-                try:
-                    status, field, data = self._ask(T_CHUNK, chunk_payload(idx), retries=1)
-                except CardError as e:
-                    if e.status is not None or self.cancelled():
-                        raise
-                    continue
-                if status:
+            for _ in range(3):
+                status, field, data = self._ask(T_CHUNK, chunk_payload(idx), retries=self.CHUNK_RETRIES)
+                if status in (ST_NOT_NOW, ST_ARG):
                     raise CardError(f"chunk {idx}: {describe(status, field)}", status)
+                if status:
+                    continue                                 # a status CHUNK never has: a bad mix, ask again
                 if field == idx and len(data) == want:
                     buf += data
                     break
@@ -390,8 +507,74 @@ class CardClient:
                 raise CardError(f"chunk {idx} did not arrive")
         return bytes(buf)
 
+    def _slower(self) -> None:
+        """Pieces got lost: the module forwards less than the meter sends; ask the meter for the next lower pace."""
+        lower = [p for p in self.PACES if p < self.pace]
+        if not lower:
+            return
+        try:
+            status, _, _ = self._ask(T_LINK, struct.pack("<BBbB", lower[0], 1, 0, 2))
+        except CardError:
+            return
+        if status == ST_OK:
+            self.pace = lower[0]
+
+    def _stream_window(self, field: int) -> bytes | None:
+        """The `field` staged bytes by STREAM (pieces of 232 bytes = CHUNK indexes; what does not arrive after a few
+        rounds is asked by CHUNK); None when the firmware has no STREAM (self.fast becomes False)."""
+        n = (field + CHUNK - 1) // CHUNK
+        got: dict[int, bytes] = {}
+        for _ in range(self.STREAM_ROUNDS):
+            missing = [i for i in range(n) if i not in got]
+            if not missing:
+                break
+            runs, start = [], missing[0]
+            for a, b in zip(missing, missing[1:] + [None]):
+                if b != a + 1:
+                    runs.append((start, a - start + 1))
+                    start = b
+            for first, count in runs:
+                if self.cancelled():
+                    raise CardError("cancelled")
+                status, _, pieces = self._stream(first, count, CHUNK)
+                if status == ST_NOT_NOW and self.fast is None and not pieces:
+                    self.fast = False                       # no STREAM in this firmware
+                    return None
+                if status not in (None, ST_OK) and not pieces:
+                    raise CardError(f"stream: {describe(status, 0)}", status)
+                fresh = 0
+                for i, d in pieces.items():
+                    want = min(CHUNK, field - i * CHUNK)
+                    if first <= i < first + count and len(d) == want:
+                        got[i] = d
+                        fresh += 1
+                if pieces:
+                    self.fast = True
+                if self.fast and count >= 4 and fresh < count * 0.8:
+                    self._slower()
+        self.streamed += len(got)
+        for i in range(n):
+            if i not in got:
+                status, fld, data = self._ask(T_CHUNK, chunk_payload(i), retries=self.CHUNK_RETRIES)
+                if status or fld != i:
+                    raise CardError(f"chunk {i}: {describe(status, fld)}", status or None)
+                got[i] = data
+        return b"".join(got[i] for i in range(n))
+
     def read_window(self, name: str, offset: int, length: int) -> bytes:
         for _ in range(self.WINDOW_TRIES):
+            if self.fast is not False:
+                field, data = self._ok(T_READ, read_payload(name, offset, length))
+                if field == 0:
+                    return b""
+                if field > length or len(data) < 4:
+                    raise CardError("READ answer out of range")
+                got = self._stream_window(field)
+                if got is None:
+                    return self.read_window(name, offset, min(length, self.window))   # older firmware
+                if zlib.crc32(got) & 0xFFFFFFFF == int.from_bytes(data[:4], "little"):
+                    return got
+                continue
             field, data = self._ok(T_READ, read_payload(name, offset, length))
             if field == 0:
                 return b""
@@ -414,7 +597,15 @@ class CardClient:
             with open(part, "wb") as out:
                 offset = 0
                 while offset < f.size:
-                    data = self.read_window(f.name, offset, min(WINDOW, f.size - offset))
+                    for attempt in range(self.WINDOW_ROUNDS):
+                        try:
+                            size = self.FAST_WINDOW if self.fast is not False else self.window
+                            data = self.read_window(f.name, offset, min(size, f.size - offset))
+                            break
+                        except CardError as e:
+                            # a streak of damaged answers (no status from the meter): ask for this piece again
+                            if e.status is not None or self.cancelled() or attempt == self.WINDOW_ROUNDS - 1:
+                                raise
                     if not data:
                         raise CardError(f"{f.name} is shorter than listed ({offset} of {f.size} bytes)")
                     out.write(data)

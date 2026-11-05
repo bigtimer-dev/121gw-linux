@@ -51,7 +51,8 @@ class Worker:
         self.jobs: queue.Queue = queue.Queue()
         self.cancel_flag = threading.Event()
         self.busy = False
-        self.client = CardClient(link.card_request, self.cancel_flag.is_set)
+        self.client = CardClient(link.card_request, self.cancel_flag.is_set,
+                                 getattr(link, "card_stream", None))
         threading.Thread(target=self._run, daemon=True, name="121gw-card").start()
 
     def submit(self, fn: Callable[[CardClient], object], done: Callable[[object, CardError | None], None]) -> None:
@@ -217,6 +218,7 @@ class CardPage(Gtk.Box):
         if self.worker.busy or not self.link.card_ready:
             return
         self.banner.set_revealed(False)
+        self.list_group.set_description("Reading the card…")
 
         def job(c: CardClient):
             files = c.files()
@@ -230,6 +232,7 @@ class CardPage(Gtk.Box):
 
     def _listed(self, result, error: CardError | None) -> None:
         if error:
+            self.list_group.set_description("Could not read the card: press Refresh to try again")
             self._error(f"Could not read the card: {error}")
             return
         self.loaded = True
@@ -277,11 +280,14 @@ class CardPage(Gtk.Box):
         self.cancel_btn.set_visible(True)
         self.progress.set_fraction(max(0.0, min(1.0, fraction)))
         rate = done / max(time.monotonic() - t0, 1e-3)
-        self.progress_label.set_label(f"{text}   {human_size(rate)}/s")
+        damaged = self.link.card_damaged - getattr(self, "_damaged0", 0)
+        self.progress_label.set_label(f"{text}   {human_size(rate)}/s" +
+                                      (f"   · {damaged} damaged answers asked again" if damaged else ""))
         return GLib.SOURCE_REMOVE
 
     def download(self, f: CardFile) -> None:
         folder, t0 = self.folder(), time.monotonic()
+        self._damaged0 = self.link.card_damaged
         self._progress(f"{f.name}: starting", 0, t0, 0)
 
         def job(c: CardClient):
@@ -300,6 +306,7 @@ class CardPage(Gtk.Box):
 
     def sync(self) -> None:
         folder, t0 = self.folder(), time.monotonic()
+        self._damaged0 = self.link.card_damaged
         self._progress("Comparing with the local folder…", 0, t0, 0)
 
         def job(c: CardClient):

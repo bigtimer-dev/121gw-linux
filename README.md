@@ -11,7 +11,7 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 
 ## Features
 
-**Card** and **Meter** (zombu4's open firmware `F-1.05` or later, custom `C-1.06` or later)
+**Card** and **Meter** (zombu4's open firmware `F-1.05` or later, custom `C-1.06` or later; fast downloads with `C-1.07`)
 
 Put the meter on its SETUP page `Ld-bt` (SETUP, then REL / PEAK to the page after `bt`; logging off). Then:
 - **Card**: lists the files on the meter's SD card with size and date, and the free space. Download a file, delete
@@ -19,7 +19,11 @@ Put the meter on its SETUP page `Ld-bt` (SETUP, then REL / PEAK to the page afte
   **Sync to Folder**: copies new and changed files into a local folder (default `~/Documents/121GW card`, the
   **Change…** button picks another). The sync never deletes anything, on either side. Every piece of a file is
   checked against the CRC-32 the meter computes, and a file is written as `<name>.part` and renamed only when it
-  is complete.
+  is complete. With custom firmware `C-1.07` or later a file comes over at about **1.1 KB/s** (a 170 KB file in
+  2.5 minutes, measured on a real meter): the meter streams 8 KB blocks, paced so its Bluetooth module neither drops
+  nor misreads bytes (`CF-08`). Older firmware works too, in 100-byte pieces at about 0.18 KB/s, with damaged answers
+  asked again and their copies combined. Full speed needs the 7.5 ms Bluetooth interval (see **Speed** under *Upload Firmware* below);
+  at a longer interval the app asks the meter to send slower.
 - **Meter**: the meter's SETUP settings (buzzer, continuity threshold and hold, auto power-off, backlight auto-off,
   battery trim, LCD contrast, display level, REL view, clock, temperature unit, thermocouple type, dBm reference,
   current-loop and RTD views, VA burden, Bluetooth rate, logging trigger and change threshold). A change goes to the
@@ -108,8 +112,11 @@ text and the meter's yellow as the only accent. *System* (main menu → Theme) u
   repaired, 2 packets sent again. That is zombu4's speed (155 kB in 160–170 s).
 
   On 2026-11-05 a capture showed 45 ms again on a later connection although the file still held the setting, so
-  BlueZ may not apply it every time. `MinConnectionInterval=12` / `MaxConnectionInterval=12` in
-  `/etc/bluetooth/main.conf` sets 15 ms for every LE device that doesn't ask for its own timing.
+  BlueZ may not apply it every time. `MinConnectionInterval=6` / `MaxConnectionInterval=6` in the `[LE]` section of
+  `/etc/bluetooth/main.conf` sets 7.5 ms for every LE device that doesn't ask for its own timing (then
+  `sudo systemctl restart bluetooth`). With a range such as 6..12 the adapter may pick 15 ms, and the meter's module
+  then forwards only half as much: it sends one 20-byte indication per confirmation, i.e. per two connection events
+  (about 1330 B/s at 7.5 ms, 660 B/s at 15 ms; measured 2026-11-05).
 
   **Direct install (zombu4's two-part bootloader, bl-v1.1.0 or later).** On a meter with firmware v1.0.4 or later
   (`C-1.04` included) the app asks which bootloader the meter has. With zombu4's bootloader the dialog offers
@@ -260,7 +267,13 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
   packet framing, types `0x10` LIST, `0x11` READ (up to 8 KB staged in the meter, answered with its CRC-32), `0x12`
   CHUNK (232 bytes of the staged data), `0x13` DELETE, `0x14` INFO, `0x16` GET and `0x17` PUT of a setting (its
   EEPROM offset and value). Answers `B5 5B 82 seq(2) len status field(2) data crc16(2)`, one request at a time;
-  answers with damaged first bytes are repaired as for the upload, when their CRC-16 proves it.
+  answers with damaged first bytes are repaired as for the upload, when their CRC-16 proves it, and damaged copies of
+  one answer are combined byte by byte (`combine_copies`, accepted only with a matching CRC-16).
+  Custom firmware `C-1.07`+ (`CF-08`): `0x19` STREAM `first(2) count(2) size(1)` sends the staged bytes as pieces
+  `B5 5B 83 idx(2) len data crc16(2)` without a request each (the app uses 232-byte pieces, the CHUNK indexes, and
+  asks again for any that did not arrive); `0x18` LINK `pace stop trim [gap]` sets the meter's sending (RAM only; the
+  app lowers the pace from 13 to 6 or 3 bytes per 10 ms when pieces get lost). Firmware without them answers `0x81`
+  status 3, and the app uses CHUNKs.
 - Version request (open firmware v1.0.1+): `F4 39 30 39 30`; the meter echoes it and answers `F6` + five ASCII
   characters (`C-102`, shown as `C-1.02`) and an XOR byte that makes the XOR of all seven bytes zero
   (`gw121/keys.py` `parse_version_answer`).
