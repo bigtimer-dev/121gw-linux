@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from datetime import datetime
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
@@ -14,7 +15,8 @@ from .lcd import LcdView
 from .link import MeterLink
 from .packet import PacketV2
 from .sessions import LIVE_WINDOW, DataPoint, Session, SessionStore, default_session_name
-from .settings import Settings
+from . import releases
+from .settings import Settings, data_dir
 from .upload import check_image, image_version
 from .views import view_for
 
@@ -107,6 +109,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_synced_beep: float | None = None
         self._dialog_open = False
         self._notified: set[str] = set()
+        self.available_release: releases.Release | None = None     # newer custom firmware than the meter's
+        self._update_checked_for: str | None = None
         self._device_rows: list[Gtk.Widget] = []
         self._session_rows: list[Gtk.Widget] = []
 
@@ -124,6 +128,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Sync Meter Clock", "win.sync-clock")
         menu.append_submenu("Meter Views", self._views_menu())
         menu.append("Upload Firmware…", "win.upload-firmware")
+        menu.append("Check for Firmware Update", "win.check-update")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("About 121GW", "app.about")
         menu.append("Quit", "app.quit")
@@ -144,6 +149,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.upload_action = Gio.SimpleAction.new("upload-firmware", None)
         self.upload_action.connect("activate", lambda *_: UploadDialog(self).present(self))
         self.add_action(self.upload_action)
+        act = Gio.SimpleAction.new("check-update", None)
+        act.connect("activate", lambda *_: self._check_update(manual=True))
+        self.add_action(act)
         for name, key in (("loop-view", "loop_view"), ("rtd-view", "rtd_view")):
             act = Gio.SimpleAction.new_stateful(name, GLib.VariantType.new("s"),
                                                 GLib.Variant.new_string(getattr(self.settings, key)))
@@ -190,6 +198,7 @@ class MainWindow(Adw.ApplicationWindow):
         outer.append(bar)
 
         self.banner = Adw.Banner()
+        self.banner.connect("button-clicked", lambda *_: self.upload_action.activate(None))
         outer.append(self.banner)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -200,7 +209,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.lcd = LcdView()
         box.append(self.lcd)
-        # SETUP page explanation (custom firmware C-1.03+, frame F7)
+        # SETUP page explanation (custom firmware C-1.03+, frame FA / F7)
         self.setup_row = Adw.ActionRow(title="", subtitle="", subtitle_lines=4)
         self.setup_row.add_prefix(Gtk.Image(icon_name="preferences-system-symbolic"))
         self.setup_meter = Gtk.Label(valign=Gtk.Align.CENTER)
@@ -542,9 +551,19 @@ class MainWindow(Adw.ApplicationWindow):
             self.battery_label.set_label("")
         self.time_label.set_label(link.meter_time or "")
 
+        self._maybe_check_update()
+
         # warnings
         warn = None
-        if link.communication_lost and (link.is_connected or link.settings.auto_reconnect or link.latest):
+        self.banner.set_button_label(None)
+        if link.update_mode and not link.upload_mode:
+            warn = ("ld", f"Meter is in its update mode (-IAP-, bootloader {link.update_mode}): no readings, "
+                          "waiting for a firmware")
+            self.banner.set_button_label("Install Firmware…")
+        elif link.on_ld_page and not link.upload_mode:
+            warn = ("ld", "Meter is on SETUP page Ld (firmware upload): no readings, waiting for a file")
+            self.banner.set_button_label("Upload Firmware…")
+        elif link.communication_lost and (link.is_connected or link.settings.auto_reconnect or link.latest):
             warn = ("lost", "121GW communication lost")
         elif link.battery_near_power_off:
             warn = ("battery", f"Meter battery low: {link.battery_voltage:.2f} V — near power-off")
@@ -554,7 +573,8 @@ class MainWindow(Adw.ApplicationWindow):
         if warn:
             self.banner.set_title(warn[1])
             self.banner.set_revealed(True)
-            self._notify(warn[0], warn[1])
+            if warn[0] != "ld":
+                self._notify(warn[0], warn[1])
         else:
             self.banner.set_revealed(False)
             self._notified.clear()
@@ -594,6 +614,10 @@ class MainWindow(Adw.ApplicationWindow):
         sub = f"{link.status_text} · {link.packets_received} packets" if link.packets_received else link.status_text
         if link.firmware_version:
             sub += f" · firmware {link.firmware_version}"
+        if link.update_mode:
+            sub += f" · update mode, bootloader {link.update_mode}"
+        elif link.bootloader:
+            sub += f" · bootloader {link.bootloader}"
         self.conn_row.set_subtitle(GLib.markup_escape_text(sub))
         self.conn_icon.set_from_icon_name(icon)
         self.power_row.set_visible(link.adapter_off)
@@ -807,6 +831,51 @@ class MainWindow(Adw.ApplicationWindow):
     def toast(self, text: str) -> None:
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=3))
 
+    # ---- newer custom firmware (gw121/releases.py) ---------------------------
+
+    def _maybe_check_update(self) -> None:
+        v = self.link.firmware_version
+        if (self.settings.check_updates and v and releases.version_key(v) is not None
+                and self._update_checked_for != v):
+            self._update_checked_for = v
+            self._check_update(manual=False)
+
+    def _check_update(self, manual: bool) -> None:
+        meter = self.link.firmware_version
+
+        def work():
+            try:
+                rel, err = releases.fetch_latest(), None
+            except Exception as e:                      # offline, GitHub unreachable, rate limit
+                rel, err = None, str(e)
+            GLib.idle_add(done, rel, err)
+
+        def done(rel, err):
+            if err:
+                if manual:
+                    self.toast(f"Update check failed: {err}")
+                return GLib.SOURCE_REMOVE
+            if releases.is_newer(rel, meter):
+                self.available_release = rel
+                t = Adw.Toast(title=GLib.markup_escape_text(f"Firmware {rel.version} is available (meter: {meter})"),
+                              button_label="Upload…", timeout=10)
+                t.connect("button-clicked", lambda *_: self.upload_action.activate(None))
+                self.toasts.add_toast(t)
+            elif manual:
+                if rel is None:
+                    self.toast("No custom firmware release found")
+                elif meter is None:
+                    self.toast(f"Latest custom firmware: {rel.version} (meter version not known)")
+                elif releases.version_key(meter) is None:
+                    self.toast(f"Latest custom firmware: {rel.version}; the meter runs {meter}, not a custom build")
+                else:
+                    self.toast(f"The meter's firmware {meter} is up to date")
+                if rel is not None and (meter is None or releases.version_key(meter) is None):
+                    self.available_release = rel
+            return GLib.SOURCE_REMOVE
+
+        threading.Thread(target=work, daemon=True).start()
+
 
 class SessionDialog(Adw.Dialog):
     def __init__(self, win: MainWindow, session: Session):
@@ -1019,6 +1088,7 @@ class UploadDialog(Adw.Dialog):
         self.win = win
         self.link = win.link
         self.data: bytes | None = None
+        self._sending_direct = False
         self.link.upload_mode = True            # page Ld sends no readings: no "communication lost" meanwhile
         self.connect("closed", self._closed)
         self.connect("close-attempt", self._close_attempt)
@@ -1027,16 +1097,14 @@ class UploadDialog(Adw.Dialog):
         tv.add_top_bar(Adw.HeaderBar())
         page = Adw.PreferencesPage()
 
-        steps = Adw.PreferencesGroup(
-            title="On the meter",
-            description=("Needs zombu4's open firmware v1.0.0 or later (C-1.02 included).\n"
-                         "1. Bluetooth on (hold PEAK), logging off, SD card in.\n"
-                         "2. SETUP, then REL / PEAK to the page Ld (after bt): the meter shows Ld-bt. "
-                         "It stops sending readings while that page is shown.\n"
-                         "3. Choose the file here and press Upload; the meter shows Ld nn (percent), then Ld oK.\n"
-                         "4. Install: switch the meter off, hold MEM + HOLD while switching it on, press SETUP. "
-                         "The upload alone does not change the installed firmware."))
+        self.steps = steps = Adw.PreferencesGroup(title="On the meter")
         page.add(steps)
+        self.direct_row = Adw.SwitchRow(
+            title="Install directly", subtitle_lines=3, visible=False,
+            subtitle="zombu4's bootloader takes the firmware straight into the flash: no SD card, no keys")
+        self.direct_row.connect("notify::active", lambda *_: self._route_changed())
+        steps.add(self.direct_row)
+        self._direct_offered = False
 
         g = Adw.PreferencesGroup(title="Firmware file")
         self.file_row = Adw.ActionRow(title="No file chosen", subtitle="EEVBlog.bin", subtitle_lines=3)
@@ -1047,6 +1115,18 @@ class UploadDialog(Adw.Dialog):
         g.add(self.file_row)
         meter = self.link.firmware_version or "unknown (v2.05 and open firmware before v1.0.1 do not say)"
         g.add(Adw.ActionRow(title="Meter firmware now", subtitle=meter))
+        self.ready_row = Adw.ActionRow(title="Meter page", subtitle_lines=2)
+        g.add(self.ready_row)
+        rel = win.available_release
+        if rel is not None:
+            self.release_row = Adw.ActionRow(title=f"Latest custom firmware: {rel.version}",
+                                             subtitle="from GitHub (bigtimer-dev/121GW-Open-Firmware), checked "
+                                                      "against its SHA-256 before use", subtitle_lines=2)
+            use = Gtk.Button(label="Use it", valign=Gtk.Align.CENTER)
+            use.connect("clicked", lambda b: self._use_release(b, rel))
+            self.release_row.add_suffix(use)
+            g.add(self.release_row)
+        self._ready_poll = GLib.timeout_add(1000, self._show_ready)
         page.add(g)
 
         pg = Adw.PreferencesGroup()
@@ -1062,7 +1142,7 @@ class UploadDialog(Adw.Dialog):
         bg = Adw.PreferencesGroup()
         btns = Gtk.Box(spacing=12, halign=Gtk.Align.END)
         self.cancel_btn = Gtk.Button(label="Cancel Upload", sensitive=False)
-        self.cancel_btn.connect("clicked", lambda *_: self.link.cancel_upload())
+        self.cancel_btn.connect("clicked", lambda *_: self._cancel())
         self.upload_btn = Gtk.Button(label="Upload", sensitive=False)
         self.upload_btn.add_css_class("suggested-action")
         self.upload_btn.connect("clicked", self._start)
@@ -1073,6 +1153,89 @@ class UploadDialog(Adw.Dialog):
 
         tv.set_content(page)
         self.set_child(tv)
+        self._show_ready()
+        self._route_changed()
+
+    CARD_STEPS = ("Needs zombu4's open firmware v1.0.0 or later (C-1.02 included).\n"
+                  "1. Bluetooth on (hold PEAK), logging off, SD card in.\n"
+                  "2. SETUP, then REL / PEAK to the page Ld (after bt): the meter shows Ld-bt. "
+                  "It stops sending readings while that page is shown.\n"
+                  "3. Choose the file here and press Upload; the meter shows Ld nn (percent), then Ld oK.\n"
+                  "4. Install: switch the meter off, hold MEM + HOLD while switching it on, press SETUP. "
+                  "The upload alone does not change the installed firmware.")
+    DIRECT_STEPS = ("The meter has zombu4's two-part bootloader.\n"
+                    "1. Bluetooth on (hold PEAK); fresh batteries are best. Stay on a measuring page.\n"
+                    "2. Choose the file here and press Install. The meter restarts into its update mode (-IAP-), "
+                    "the app connects again and sends the file (Ld nn on the meter), the bootloader checks it.\n"
+                    "3. The meter restarts into the new firmware by itself.\n"
+                    "If the transfer stops halfway, the meter stays in its update mode (-IAP-) until a firmware "
+                    "arrives: send it again, or use the SD card (MEM + HOLD at power-on).")
+
+    @property
+    def direct(self) -> bool:
+        return self.direct_row.get_visible() and self.direct_row.get_active()
+
+    def _route_changed(self) -> None:
+        self.steps.set_description(self.DIRECT_STEPS if self.direct else self.CARD_STEPS)
+        self.upload_btn.set_label("Install" if self.direct else "Upload")
+        self.cancel_btn.set_label("Cancel")
+        self._show_ready()
+
+    def _use_release(self, button, rel) -> None:
+        button.set_sensitive(False)
+        self.status.set_label(f"Downloading {rel.version}…")
+
+        def work():
+            try:
+                data, err = releases.download(rel, data_dir() / "firmware"), None
+            except Exception as e:
+                data, err = None, str(e)
+            GLib.idle_add(done, data, err)
+
+        def done(data, err):
+            button.set_sensitive(True)
+            if err:
+                self._set_file(None, f"{rel.version} from GitHub", f"Refused: {err}")
+                return GLib.SOURCE_REMOVE
+            import hashlib
+            self._set_file(data, f"EEVBlog.bin {rel.version} (GitHub release {rel.tag})",
+                           f"{len(data):,} bytes · SHA-256 {hashlib.sha256(data).hexdigest()[:16]}… "
+                           f"(matches the release)\nversion {rel.version}")
+            return GLib.SOURCE_REMOVE
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_ready(self) -> bool:
+        offered = self.link.direct_update or self.link._boot_job is not None
+        if offered != self.direct_row.get_visible():
+            self.direct_row.set_visible(offered)
+            if offered and not self._direct_offered:
+                self._direct_offered = True
+                self.direct_row.set_active(True)
+            self._route_changed()
+            return GLib.SOURCE_CONTINUE
+        if self.direct:
+            if self.link.uploading:
+                self.ready_row.set_subtitle("updating")
+            elif self.link.update_mode:
+                self.ready_row.set_subtitle(f"update mode (-IAP-, bootloader {self.link.update_mode}): ready")
+            elif self.link.is_connected:
+                self.ready_row.set_subtitle(f"firmware running, bootloader {self.link.bootloader}: Install "
+                                            "restarts the meter into its update mode")
+            else:
+                self.ready_row.set_subtitle("not connected")
+            return GLib.SOURCE_CONTINUE
+        if not self.link.is_connected:
+            self.ready_row.set_subtitle("not connected")
+        elif self.link.uploading:
+            self.ready_row.set_subtitle("Ld: receiving")
+        elif self.link.on_ld_page:
+            self.ready_row.set_subtitle("Ld: ready for the file")
+        elif self.link.latest is not None and not self.link.communication_lost:
+            self.ready_row.set_subtitle("not Ld yet: the meter is sending readings (go to SETUP page Ld)")
+        else:
+            self.ready_row.set_subtitle("checking…")
+        return GLib.SOURCE_CONTINUE
 
     def _choose(self, *_):
         fd = Gtk.FileDialog(title="Choose Firmware", modal=True)
@@ -1118,23 +1281,35 @@ class UploadDialog(Adw.Dialog):
         self.progress.set_text("")
         self.status.set_label("" if data is not None else "Choose an EEVBlog.bin firmware image.")
 
+    def _cancel(self) -> None:
+        self.link.cancel_upload()
+        self.link.cancel_install()
+
     def _start(self, *_):
         if self.data is None:
             return
         self.upload_btn.set_sensitive(False)
         self.choose_btn.set_sensitive(False)
+        self.direct_row.set_sensitive(False)
         self.cancel_btn.set_sensitive(True)
         self.status.remove_css_class("error")
         self.status.remove_css_class("success")
-        self.status.set_label("Waiting for the meter (page Ld)…")
+        self.status.add_css_class("dim-label")
         self.set_can_close(False)
-        self.link.upload_firmware(self.data, self._progress, self._done)
+        self._sending_direct = self.direct
+        if self._sending_direct:
+            self.status.set_label("Starting…")
+            self.link.install_firmware(self.data, self._progress, self._done, self.status.set_label)
+        else:
+            self.status.set_label("Waiting for the meter (page Ld)…")
+            self.link.upload_firmware(self.data, self._progress, self._done)
 
     def _progress(self, fraction, sent, total, rate):
         self.progress.set_fraction(fraction)
         self.progress.set_text(f"{fraction * 100:.0f} %")
         if sent >= total:
-            self.status.set_label("Meter checks the file and writes EEVBlog.bin on the card…")
+            self.status.set_label("The bootloader checks the firmware…" if self._sending_direct else
+                                  "Meter checks the file and writes EEVBlog.bin on the card…")
         else:
             left = (total - sent) / rate if rate > 0 else 0
             self.status.set_label(f"{sent:,} / {total:,} bytes · {rate:,.0f} B/s · about {left:.0f} s left")
@@ -1143,6 +1318,7 @@ class UploadDialog(Adw.Dialog):
         self.set_can_close(True)
         self.cancel_btn.set_sensitive(False)
         self.choose_btn.set_sensitive(True)
+        self.direct_row.set_sensitive(True)
         self.upload_btn.set_sensitive(self.data is not None and self.link.is_connected)
         if ok:
             self.progress.set_fraction(1.0)
@@ -1150,12 +1326,17 @@ class UploadDialog(Adw.Dialog):
         self.status.remove_css_class("dim-label")
         self.status.add_css_class("success" if ok else "error")
         self.status.set_label(text)
-        if text != "Upload cancelled":
-            self.win.toast("Firmware upload finished" if ok else "Firmware upload failed")
+        if not text.startswith(("Upload cancelled", "Update cancelled")):
+            if self._sending_direct:
+                self.win.toast("Firmware installed: the meter restarts into it" if ok else "Firmware update failed")
+            else:
+                self.win.toast("Firmware upload finished" if ok else "Firmware upload failed")
 
     def _close_attempt(self, *_):
         d = Adw.AlertDialog(heading="Stop the upload?",
-                            body="The file on the meter's card stays as it was; send it again later.")
+                            body="The meter stays in its update mode (-IAP-) until a firmware is sent; send it again "
+                                 "later." if self._sending_direct else
+                                 "The file on the meter's card stays as it was; send it again later.")
         d.add_response("keep", "Keep Uploading")
         d.add_response("stop", "Stop and Close")
         d.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
@@ -1163,13 +1344,16 @@ class UploadDialog(Adw.Dialog):
 
         def answered(_d, r):
             if r == "stop":
-                self.link.cancel_upload()
+                self._cancel()
                 self.force_close()
 
         d.connect("response", answered)
         d.present(self)
 
     def _closed(self, *_):
-        self.link.cancel_upload()
+        if self._ready_poll:
+            GLib.source_remove(self._ready_poll)
+            self._ready_poll = 0
+        self._cancel()
         self.link.upload_mode = False
         self.win.refresh()

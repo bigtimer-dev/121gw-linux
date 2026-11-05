@@ -4,14 +4,15 @@ The 19-byte status frame describes the secondary display only for the setup item
 other page (and for v2.05's beeper, ID and logging-interval pages) it sends zeros. The custom firmware C-1.03 and later
 also sends, while a SETUP page is shown, an 11-byte frame with exactly what the small display shows:
 
-    F7 item c0 c1 c2 c3 c4 flags units 00 xor
+    FA item c0 c1 c2 c3 c4 flags units 00 xor      (C-1.03: F7 instead of FA)
       item    the SETUP page (setup item number; 0 = back to the normal display)
       c0..c4  the five characters of the small display (ASCII as the meter draws them)
       flags   bits 0..2 decimal point (digits after it), bit 4 minus sign, bit 5 the page is being edited
       units   bit 0 V, 1 A, 2 m, 3 k, 4 Hz, 5 dB, 6 Ω
       xor     makes the XOR of all eleven bytes zero
 
-(firmware: ble/subtext.s in bigtimer-dev/121GW-Open-Firmware.) Older firmware never sends it; the app then shows what
+(firmware: ble/subtext.s in bigtimer-dev/121GW-Open-Firmware.) C-1.04 moved the first byte to FA because zombu4's
+v1.0.4 answers its bootloader version request with a 7-byte F7 frame; both first bytes are read here. Older firmware never sends it; the app then shows what
 the status frame says, as before.
 """
 
@@ -21,6 +22,7 @@ import re
 from dataclasses import dataclass
 
 FRAME_LEN = 11
+FRAME_STARTS = (0xFA, 0xF7)            # C-1.04+, C-1.03
 
 # item -> (short name as on the meter, title, what it does)
 PAGES: dict[int, tuple[str, str, str]] = {
@@ -133,10 +135,10 @@ class SetupText:
 
 
 def parse_setup_frames(buf: bytes) -> tuple[list[SetupText], int]:
-    """All valid F7 frames in buf, and how many leading bytes are done (keep the rest for the next call)."""
+    """All valid SETUP text frames (FA, or F7 from C-1.03) in buf, and how many leading bytes are done (keep the rest for the next call)."""
     out, i, done = [], 0, 0
     while i < len(buf):
-        if buf[i] == 0xF7:
+        if buf[i] in FRAME_STARTS:
             if i + FRAME_LEN > len(buf):
                 return out, i
             f = buf[i:i + FRAME_LEN]

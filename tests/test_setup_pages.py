@@ -6,8 +6,8 @@ from gw121.packet import build_frame
 from gw121.setup_pages import PAGES, parse_setup_frames
 
 
-def frame(item, text, flags=0, units=0) -> bytes:
-    b = bytes([0xF7, item]) + text.encode("latin1") + bytes([flags, units, 0])
+def frame(item, text, flags=0, units=0, start=0xFA) -> bytes:
+    b = bytes([start, item]) + text.encode("latin1") + bytes([flags, units, 0])
     x = 0
     for c in b:
         x ^= c
@@ -52,6 +52,19 @@ class ParseTests(unittest.TestCase):
             got += frames
             buf = buf[done:]
         self.assertEqual([(f.item, f.chars) for f in got], [(24, "dSP 2"), (0, "  250")])
+
+    def test_c103_first_byte_f7(self):
+        st = parse_setup_frames(frame(21, "bt 20", start=0xF7))[0][0]
+        self.assertEqual((st.name, st.value), ("Bluetooth rate", "20"))
+
+    def test_bootloader_answer_is_not_a_page(self):
+        """v1.0.4's bootloader version answer F7 "B-EEV" xor (7 bytes) between status frames is no SETUP page."""
+        ans = b"\xF7B-EEV"
+        x = 0
+        for c in ans:
+            x ^= c
+        data = build_frame(1, 100, 1) + ans + bytes([x]) + build_frame(1, 101, 1)
+        self.assertEqual(parse_setup_frames(data)[0], [])
 
     def test_bad_checksum_ignored(self):
         f = bytearray(frame(21, "bt 20"))

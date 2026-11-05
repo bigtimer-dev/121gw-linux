@@ -65,6 +65,24 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
   (282 sent again); 11.25 ms (`9`) 13½ min, the same speed as the default, so it was apparently not applied. The
   meter's serial line (19200 baud) limits any setting to about 1½ minutes. Every upload, slow or not, ended with the
   meter's own check (length, CRC-32, image header, copy read back): a lost packet costs time, not data.
+
+  On 2026-11-05 a capture showed 45 ms again on a later connection although the file still held the setting, so
+  BlueZ may not apply it every time. `MinConnectionInterval=12` / `MaxConnectionInterval=12` in
+  `/etc/bluetooth/main.conf` sets 15 ms for every LE device that doesn't ask for its own timing.
+
+  **Direct install (zombu4's two-part bootloader, bl-v1.1.0 or later).** On a meter with firmware v1.0.4 or later
+  (`C-1.04` included) the app asks which bootloader the meter has. With zombu4's bootloader the dialog offers
+  **Install directly** (on by default): no SD card and no keys. The app restarts the meter into its update mode
+  (`-IAP-`), connects again, and sends the file straight to the flash with two packets in flight. The bootloader
+  checks the length and CRC-32 before it marks the firmware valid, then restarts into it. If the transfer stops halfway,
+  the meter stays in its update mode until a firmware arrives; the app shows this in a banner, and the card route
+  (MEM + HOLD) still works. In the emulator, against zombu4's bootloader code, a 170 KB image took 97 s, including
+  7 packets dropped on purpose and sent again. With EEVblog's bootloader (`B-EEV`) the dialog keeps the card route.
+- **Check for Firmware Update** (main menu): looks for the newest custom build (`custom-cA.BC` release with
+  `EEVBlog.bin` and `SHA256SUMS`) on [bigtimer-dev/121GW-Open-Firmware](https://github.com/bigtimer-dev/121GW-Open-Firmware/releases).
+  A meter running an older custom build is offered it automatically; the download is used only when its SHA-256, the
+  image check and the version inside it match. While the meter is on SETUP page `Ld` (no readings) the app says so in
+  a banner instead of "communication lost".
 - **Meter Views** (main menu), for meters with zombu4's open firmware v0.9.6 or later: shows DC mA as percent of a
   **4–20 mA / 0–20 mA loop** and Ω as the temperature of a **PT100 / PT1000** sensor, as the meter's SETUP pages
   `LP` and `Pt` do. The Bluetooth frame doesn't say which view the meter shows, so set the same view here. The app
@@ -196,12 +214,20 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
   characters (`C-102`, shown as `C-1.02`) and an XOR byte that makes the XOR of all seven bytes zero
   (`gw121/keys.py` `parse_version_answer`).
 - SETUP page text (custom firmware `C-1.03`+, `CF-07`): while a SETUP page is shown the meter also sends
-  `F7 item c0..c4 flags units 00 xor` (11 bytes): the page number, the five characters of the small display, the
+  `FA item c0..c4 flags units 00 xor` (`F7` in `C-1.03`) (11 bytes): the page number, the five characters of the small display, the
   decimal point (flags bits 0..2), minus (bit 4), editing (bit 5), unit icons (V, A, m, k, Hz, dB, Ω) and an XOR byte
   that makes the XOR of all eleven bytes zero; item 0 once when the page is left (`gw121/setup_pages.py`).
 - Firmware upload (open firmware v1.0.0+, page `Ld`, firmware `ble/bft.s`): packets `B5 5B type seq(2) len payload
   crc16(2)` (type 1 START with size and CRC-32, 2 DATA, 3 END, 4 ABORT; CRC-16/CCITT-FALSE), each answered
-  `B5 5B 81 seq(2) 03 status next(2) crc16(2)` (`gw121/upload.py`).
+  `B5 5B 81 seq(2) 03 status next(2) crc16(2)` (`gw121/upload.py`). A STATUS packet (type 5) with the index `0x80`
+  tells the two silent states apart: the page `Ld` refuses it (status 3), the bootloader's update mode answers status
+  0 with its version (`major << 8 | minor << 4 | patch`).
+- Bootloader (firmware v1.0.4+, `ble/blcmd.s`): key code `0x92` (`F4 39 32 39 32`) is answered with
+  `F7 "B-EEV"` (EEVblog's bootloader) or `F7 "B-" + three digits` and an XOR byte; `0x91` (`F4 39 31 39 31`) restarts
+  into zombu4's bootloader's update mode. There START also carries the kind (`0` = firmware), the meter erases before
+  it answers, up to two packets may be in flight, and it restarts into the firmware after END (`BootSession`).
+  The custom firmware's SETUP text frame starts with `FA` from `C-1.04` on (`F7` in `C-1.03`), since v1.0.4 uses
+  `F7` for the bootloader answer.
 
 ## Development
 

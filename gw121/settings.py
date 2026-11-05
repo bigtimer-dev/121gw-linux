@@ -30,6 +30,7 @@ DEFAULTS = {
     "loop_view": "off",           # open firmware LP view mirrored by the app: off / 4-20 / 0-20 (gw121/views.py)
     "rtd_view": "off",            # open firmware Pt view: off / pt100 / pt1000
     "rtd_unit": "°C",             # the meter's temperature unit, learnt from its TEMP readings
+    "check_updates": True,        # look for a newer custom firmware release when the meter runs a C-build
 }
 
 

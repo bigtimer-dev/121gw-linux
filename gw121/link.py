@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
@@ -13,12 +14,16 @@ from gi.repository import GLib
 from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
 from .packet import FrameAssembler, PacketV2
 from .setup_pages import SetupText, parse_setup_frames
-from .upload import AnswerParser, UploadSession
+from .upload import (BOOTLOADER_INFO_REQUEST, PROBE_SEQ, T_DATA, UPDATE_MODE_REQUEST, AnswerParser, BootSession,
+                     UploadSession, has_direct_update, image_version, parse_bootloader_answer, probe_packet,
+                     probe_result)
 
 COMM_TIMEOUT = 5.0
 BATTERY_LOW_V = 4.5
 BATTERY_POWER_OFF_V = 4.2
 CLOCK_REPLY_MS = 3000   # the meter echoes a set-clock frame within a few frames
+UPDATE_MODE_WAIT_S = 90  # 0x91 sent: the meter restarts, the link comes back, the bootloader answers the probe
+UPDATE_MODE_REFUSED_S = 8  # readings still flowing this long after 0x91 without a drop: no zombu4 bootloader
 
 
 @dataclass
@@ -66,10 +71,31 @@ class MeterLink:
         self.firmware_version: str | None = None    # open firmware v1.0.1+ answers the version request
         self._version_tail = bytearray()
         self._version_asks = 0
-        self.setup_text: SetupText | None = None    # custom firmware C-1.03+: the SETUP page shown (frame F7)
+        self.setup_text: SetupText | None = None    # custom firmware C-1.03+: the SETUP page shown (frame FA, F7 in C-1.03)
         self._setup_buf = bytearray()
         self._setup_at = 0.0
         self.upload_mode = False        # the upload dialog is open: the meter's page Ld sends no reading frames
+        # zombu4's two-part bootloader: firmware v1.0.4+ answers 0x92 ("B-EEV" or "B-1.11"); in its update mode the
+        # meter sends nothing but answers the probe with its version
+        self.bootloader: str | None = None
+        self._boot_tail = bytearray()
+        self._boot_asks = 0
+        self.update_mode: str | None = None
+        self._boot: BootSession | None = None
+        self._boot_job: dict | None = None      # data and callbacks of a direct update, from 0x91 to the END answer
+        self._boot_tx: deque[tuple[int, bytes]] = deque()
+        self._boot_writing = False
+        self._boot_timer = 0
+        self._boot_wait_timer = 0
+        self._boot_parser = AnswerParser()
+        self._boot_prev_auto: bool | None = None
+        # page Ld detection: when the readings stop, ask with a STATUS packet; only the page Ld answers it
+        self.on_ld_page = False
+        self._connected_at: float | None = None
+        self._probe_parser = AnswerParser()
+        self._probe_n = 0
+        self._probe_at = 0.0
+        self._probe_answer_at = 0.0
         self._upload: UploadSession | None = None
         self._upload_parser = AnswerParser()
         self._upload_timer = 0
@@ -121,6 +147,7 @@ class MeterLink:
 
     def _start_watchdog(self) -> None:
         self._stop_watchdog()
+        self._connected_at = time.monotonic()
         self._watchdog_id = GLib.timeout_add_seconds(1, self._watchdog_tick)
 
     def _stop_watchdog(self) -> None:
@@ -128,11 +155,34 @@ class MeterLink:
             GLib.source_remove(self._watchdog_id)
             self._watchdog_id = 0
 
+    PROBE_AFTER = 2.0                   # seconds without readings before asking whether the meter is on page Ld
+    PROBE_EVERY = 3.0
+    PROBE_STALE = 7.0                   # no answer for this long: no longer on page Ld
+
+    def _probe_ld(self) -> None:
+        """Ask whether the silent meter is on the page Ld (open firmware v1.0.0+: only that page answers)."""
+        now = time.monotonic()
+        if not self.is_connected or self._upload is not None or self._boot is not None:
+            return
+        waiting = self._boot_job is not None    # waiting for the update mode: ask at once and often
+        quiet_since = self._last_packet_at if self._last_packet_at is not None else self._connected_at
+        if quiet_since is None or now - quiet_since < (0.5 if waiting else self.PROBE_AFTER):
+            return
+        if (self.on_ld_page or self.update_mode) and now - self._probe_answer_at > self.PROBE_STALE:
+            self.on_ld_page = False
+            self.update_mode = None
+            self.changed()
+        if now - self._probe_at >= (1.0 if waiting else self.PROBE_EVERY):
+            self._probe_at = now
+            self._probe_n += 1
+            self.write_frame(probe_packet(self._probe_n), None)
+
     def _watchdog_tick(self) -> bool:
+        self._probe_ld()
         if not self.is_connected:
             lost = True
-        elif self.upload_mode:
-            lost = False                # page Ld: no reading frames by design
+        elif self.upload_mode or self.on_ld_page or self.update_mode or self._boot_job is not None:
+            lost = False                # page Ld, update mode: no reading frames by design
         else:
             lost = self._last_packet_at is not None and time.monotonic() - self._last_packet_at > COMM_TIMEOUT
         if lost != self.communication_lost:
@@ -144,6 +194,15 @@ class MeterLink:
         if self._upload is not None:
             for a in self._upload_parser.feed(data):
                 self._upload_answer(*a)
+        elif self._boot is not None:
+            for a in self._boot_parser.feed(data):
+                self._boot_answer(*a)
+        elif self._probe_at:
+            for seq, status, nxt in self._probe_parser.feed(data):
+                if seq & 0xFF00 == PROBE_SEQ:
+                    self._probe_answered(status, nxt)
+        if self.bootloader is None and self._boot_asks:
+            self._match_bootloader(data)
         if self._clock_frame is not None:
             self._match_clock_echo(data)
         if self.firmware_version is None and self._version_asks:
@@ -153,7 +212,28 @@ class MeterLink:
         if packets:
             self._publish(packets[-1])
 
+    def _probe_answered(self, status: int, nxt: int) -> None:
+        self._probe_answer_at = time.monotonic()
+        boot = probe_result(status, nxt)
+        ld = boot is None
+        if ld != self.on_ld_page or boot != self.update_mode:
+            self.on_ld_page, self.update_mode = ld, boot
+            self.communication_lost = False
+            self.changed()
+        if boot and self._boot_job is not None and self._boot is None:
+            self._boot_begin()
+
     def _publish(self, pkt: PacketV2) -> None:
+        if self.on_ld_page or self.update_mode or self._probe_at:
+            self._probe_at = 0.0                    # readings again: the page Ld was left
+            self.on_ld_page = False
+            self.update_mode = None
+            self._probe_parser.clear()
+        job = self._boot_job
+        if job is not None and self._boot is None and not job["dropped"] and \
+                time.monotonic() - job["asked_at"] > UPDATE_MODE_REFUSED_S:
+            self._boot_finish(False, "The meter did not restart into its update mode: it needs zombu4's two-part "
+                                     "bootloader (bl-v1.1.0 or later). Use the SD card route instead.")
         self.latest = pkt
         self._last_packet_at = time.monotonic()
         self.communication_lost = False
@@ -166,6 +246,10 @@ class MeterLink:
         if self.firmware_version is None and self.packets_received in (2, 12) and self._version_asks < 2:
             self._version_asks += 1                 # ask once the link streams; once more if the answer was lost
             self.write_frame(VERSION_REQUEST, None)
+        elif self.bootloader is None and self._asks_bootloader() and self._boot_asks < 2 and \
+                self.packets_received in (4, 16, 30):
+            self._boot_asks += 1
+            self.write_frame(BOOTLOADER_INFO_REQUEST, None)
         for fn in list(self._packet_listeners):
             fn(pkt)
         self.changed()
@@ -189,6 +273,32 @@ class MeterLink:
         elif self.setup_text is not None and time.monotonic() - self._setup_at > self.SETUP_TEXT_TIMEOUT:
             self.setup_text = None
             self.changed()
+
+    def _asks_bootloader(self) -> bool:
+        """Open firmware v1.0.4+ answers the bootloader request (code 0x92); older builds only echo it."""
+        v = self.firmware_version
+        if not v or v[0] not in "FC":
+            return False
+        try:
+            return float(v[2:]) >= 1.04
+        except ValueError:
+            return False
+
+    def _match_bootloader(self, data: bytes) -> None:
+        tail = self._boot_tail
+        tail += data
+        b = parse_bootloader_answer(bytes(tail))
+        if b:
+            self.bootloader = b
+            tail.clear()
+            self.changed()
+        elif len(tail) > 64:
+            del tail[:-6]
+
+    @property
+    def direct_update(self) -> bool:
+        """The meter can take firmware straight into its flash (zombu4's bootloader), no SD card or keys."""
+        return self.update_mode is not None or has_direct_update(self.bootloader)
 
     def _match_version(self, data: bytes) -> None:
         tail = self._version_tail
@@ -215,7 +325,20 @@ class MeterLink:
         self._version_asks = 0
         self.setup_text = None
         self._setup_buf.clear()
+        self.on_ld_page = False
+        self.update_mode = None
+        self.bootloader = None
+        self._boot_tail.clear()
+        self._boot_asks = 0
+        self._probe_at = self._probe_answer_at = 0.0
+        self._probe_parser.clear()
         self._upload_finish(False, "Upload stopped: disconnected")
+        if self._boot_job is not None:
+            if self._boot is not None:
+                self._boot_finish(False, "Disconnected during the transfer. The meter stays in its update mode "
+                                         "(-IAP-): connect again and send the file again.")
+            else:
+                self._boot_job["dropped"] = True    # the restart into the update mode
 
     def note_key(self, key: MeterKey) -> None:
         """Track whether the meter is in its SETUP menu (REL/PEAK act as arrows there)."""
@@ -284,7 +407,7 @@ class MeterLink:
 
     @property
     def uploading(self) -> bool:
-        return self._upload is not None
+        return self._upload is not None or self._boot_job is not None
 
     def upload_firmware(self, data: bytes, on_progress: Callable[[float, int, int, float], None],
                         on_done: Callable[[bool, str], None]) -> None:
@@ -390,6 +513,149 @@ class MeterLink:
         self._upload_parser.clear()
         if cb is not None:
             cb(ok, text)
+        self.changed()
+
+    # ---- direct firmware update through zombu4's bootloader ----------------
+
+    def install_firmware(self, data: bytes, on_progress: Callable[[float, int, int, float], None],
+                         on_done: Callable[[bool, str], None], on_state: Callable[[str], None] | None = None) -> None:
+        """Write a firmware image straight into the meter's flash: restart into the bootloader's update mode (0x91)
+        unless it is there, then the bootloader's transfer. The meter restarts into the new firmware afterwards."""
+        if not self.is_connected:
+            on_done(False, "Not connected")
+            return
+        self.cancel_upload()
+        if self._boot_job is not None:
+            self._boot_finish(False, "Replaced by a new update")
+        self._boot_job = {"data": bytes(data), "progress": on_progress, "done": on_done, "state": on_state,
+                          "asked_at": time.monotonic(), "dropped": False, "version": image_version(data)}
+        if self._boot_prev_auto is None and self.settings is not None:
+            self._boot_prev_auto = bool(getattr(self.settings, "auto_reconnect", True))
+            self.set_auto_reconnect(True)           # the meter restarts: the link has to come back by itself
+        self._boot_wait_timer = GLib.timeout_add_seconds(UPDATE_MODE_WAIT_S, self._boot_wait_timed_out)
+        if self.update_mode:
+            self._boot_begin()
+            return
+        self._boot_state("Restarting the meter into its update mode…")
+        self.write_frame(UPDATE_MODE_REQUEST, None)
+
+    def _boot_state(self, text: str) -> None:
+        job = self._boot_job
+        if job is not None and job["state"]:
+            job["state"](text)
+
+    def _boot_wait_timed_out(self) -> bool:
+        self._boot_wait_timer = 0
+        if self._boot_job is not None and self._boot is None:
+            self._boot_finish(False, "The meter did not come back in its update mode. If it shows -IAP-, connect "
+                                     "again and send the file; otherwise use the SD card route.")
+        return GLib.SOURCE_REMOVE
+
+    def _boot_begin(self) -> None:
+        job = self._boot_job
+        if self._boot_wait_timer:
+            GLib.source_remove(self._boot_wait_timer)
+            self._boot_wait_timer = 0
+        self._boot = BootSession(job["data"])
+        self._boot_parser.clear()
+        self._boot_tx.clear()
+        job["t0"] = time.monotonic()
+        self._boot_state(f"Update mode ({self.update_mode}): erasing the firmware…")
+        self._boot_restart_timer()
+        self._boot_pump()
+
+    def _boot_pump(self) -> None:
+        s = self._boot
+        if s is None:
+            return
+        for p in s.to_send():
+            self._boot_tx.append((int.from_bytes(p[3:5], "little") if p[2] == T_DATA else -1, p))
+        if self._boot_writing or not self._boot_tx:
+            return
+        _seq, p = self._boot_tx.popleft()
+        self._boot_writing = True
+        session = s
+
+        def written(err: str | None) -> None:
+            if self._boot is not session:
+                return
+            self._boot_writing = False
+            if err:
+                self._boot_finish(False, f"Bluetooth write failed: {err}. If the meter shows -IAP-, send the file "
+                                         "again.")
+                return
+            self._boot_pump()
+
+        self._write_pieces(p, written)
+
+    def _boot_answer(self, seq: int, status: int, nxt: int) -> None:
+        s = self._boot
+        if s is None:
+            return
+        phase = s.phase
+        if not s.answer(seq, status, nxt):
+            return
+        if s.done:
+            self._boot_finish(s.ok, s.message)
+            return
+        if s.phase == "data":
+            # packets queued but not yet written that the session will send again (or no longer needs)
+            self._boot_tx = deque((n, p) for n, p in self._boot_tx if n < s.next_send and n >= s.acked)
+        if phase == "start" and s.phase == "data":
+            self._boot_state("Sending the firmware…")
+        self._boot_restart_timer()
+        job = self._boot_job
+        if job and job["progress"]:
+            elapsed = max(time.monotonic() - job["t0"], 1e-6)
+            job["progress"](s.fraction, s.sent_bytes, len(s.data), s.sent_bytes / elapsed)
+        if s.phase == "end" and phase == "data":
+            self._boot_state("The bootloader checks the firmware…")
+        self._boot_pump()
+
+    def _boot_restart_timer(self) -> None:
+        if self._boot_timer:
+            GLib.source_remove(self._boot_timer)
+        self._boot_timer = GLib.timeout_add(self._boot.timeout_ms, self._boot_timed_out)
+
+    def _boot_timed_out(self) -> bool:
+        self._boot_timer = 0
+        s = self._boot
+        if s is None:
+            return GLib.SOURCE_REMOVE
+        if s.timeout():
+            self._boot_tx.clear()
+            self._boot_restart_timer()
+            self._boot_pump()
+        else:
+            self._boot_finish(False, s.message)
+        return GLib.SOURCE_REMOVE
+
+    def cancel_install(self) -> None:
+        if self._boot_job is None:
+            return
+        sending = self._boot is not None
+        self._boot_finish(False, "Update cancelled" + (": the firmware is erased, the meter stays in its update mode "
+                                                       "(-IAP-) until a firmware is sent" if sending else ""))
+        if sending:
+            GLib.timeout_add(300, lambda: (self._write_pieces(BootSession(b"").abort_packet(), None),
+                                           GLib.SOURCE_REMOVE)[1])
+
+    def _boot_finish(self, ok: bool, text: str) -> None:
+        for attr in ("_boot_timer", "_boot_wait_timer"):
+            if getattr(self, attr):
+                GLib.source_remove(getattr(self, attr))
+                setattr(self, attr, 0)
+        job = self._boot_job
+        self._boot_job = self._boot = None
+        self._boot_tx.clear()
+        self._boot_writing = False
+        self._boot_parser.clear()
+        if self._boot_prev_auto is not None:
+            prev, self._boot_prev_auto = self._boot_prev_auto, None
+            if not prev:                            # back after the meter's restart into the new firmware
+                GLib.timeout_add_seconds(60, lambda: (self.set_auto_reconnect(False), GLib.SOURCE_REMOVE)[1])
+        if job is not None and job["done"]:
+            job["done"](ok, text)
         self.changed()
 
     # ---- transport API (overridden) ----------------------------------------

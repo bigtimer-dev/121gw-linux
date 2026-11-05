@@ -8,6 +8,8 @@ Frames arrive as GATT indications; BlueZ's StartNotify enables them.
 
 from __future__ import annotations
 
+from collections import deque
+
 from gi.repository import Gio, GLib
 
 from .keys import MeterKey
@@ -51,6 +53,10 @@ class BluezLink(MeterLink):
         self.write_char: str | None = None
         self.write_mtu = 0                      # ATT MTU of the write characteristic (BlueZ 5.62+; 0 = not known)
         self.write_type = "request"
+        # one WriteValue at a time: BlueZ refuses a second one on the characteristic while the first is in flight
+        # ("In Progress"); the others wait here in order
+        self._write_queue: deque[tuple[bytes, object]] = deque()
+        self._writing = False
         self._subs: list[int] = []
         self._resolve_timeout_id = 0
         self._retry_id = 0
@@ -426,6 +432,7 @@ class BluezLink(MeterLink):
         if disconnect and self.device_path:
             self._call(self.device_path, IFACE_DEVICE, "Disconnect", None)
         self._reset_link_state()
+        self._flush_writes("Not connected")
         self.notify_char = self.write_char = None
         self.device_path = None
         self.changed()
@@ -510,19 +517,41 @@ class BluezLink(MeterLink):
         return max(20, self.write_mtu - 3) if self.write_mtu else 20
 
     def write_frame(self, payload: bytes, done=None) -> None:
-        """Write a command frame to the meter; done(error message or None) after BlueZ answers."""
+        """Write a command frame to the meter; done(error message or None) after BlueZ answers. Writes go out one
+        after the other in the order asked."""
         target = self.write_char or self.notify_char
         if not self.is_connected or not target:
             if done:
                 done("Not connected" if not self.is_connected else "No write characteristic")
             return
+        self._write_queue.append((bytes(payload), done))
+        if not self._writing:
+            self._pump_writes()
+
+    def _pump_writes(self) -> None:
+        target = self.write_char or self.notify_char
+        if not self._write_queue or not self.is_connected or not target:
+            self._writing = False
+            return
+        payload, done = self._write_queue.popleft()
+        self._writing = True
         params = GLib.Variant("(aya{sv})", (payload, {"type": GLib.Variant("s", self.write_type)}))
 
         def finished(_res, err):
+            self._writing = False
             if done:
                 done(err.message.split(":")[-1].strip() if err else None)
+            if not self._writing:
+                self._pump_writes()
 
         self._call(target, IFACE_CHAR, "WriteValue", params, finished)
+
+    def _flush_writes(self, why: str) -> None:
+        pending, self._write_queue = list(self._write_queue), deque()
+        self._writing = False
+        for _payload, done in pending:
+            if done:
+                done(why)
 
     def send_key(self, key: MeterKey, long_press: bool = False) -> None:
         if not self.is_connected:

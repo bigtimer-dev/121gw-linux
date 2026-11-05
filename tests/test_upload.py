@@ -7,6 +7,7 @@ from gi.repository import GLib
 from gw121 import upload as U
 from gw121.demo import DemoSdReceiver
 from gw121.link import MeterLink
+from gw121.packet import build_frame
 
 
 def image(size=20000, sp=0x20014000, reset=0x08006101) -> bytes:
@@ -221,8 +222,34 @@ class LinkTests(unittest.TestCase):
         spin(0.5)
         self.assertEqual([p[2] for p in link.written if len(p) > 2 and p[:2] == b"\xB5\x5B"][-1], U.T_ABORT)
 
+    def test_probe_finds_page_ld(self):
+        link = FakeLink()                                 # its meter answers transfer packets: it shows the page Ld
+        link._last_packet_at = time.monotonic() - 3       # readings stopped 3 s ago
+        link._watchdog_tick()
+        self.assertTrue(link.on_ld_page)
+        self.assertEqual(link.written[-1][2], U.T_STATUS)
+        self.assertFalse(link.communication_lost)
+        link.ingest(build_frame(1, 100, 1))               # readings again: the page was left
+        self.assertFalse(link.on_ld_page)
+
+    def test_probe_unanswered_is_lost(self):
+        link = FakeLink()
+        link.write_frame = lambda payload, done=None: link.written.append(bytes(payload))   # nobody answers
+        link._last_packet_at = time.monotonic() - 6
+        link._watchdog_tick()
+        self.assertEqual(link.written[-1][2], U.T_STATUS)
+        self.assertFalse(link.on_ld_page)
+        self.assertTrue(link.communication_lost)
+
+    def test_no_probe_while_readings_flow(self):
+        link = FakeLink()
+        link._last_packet_at = time.monotonic()
+        link._watchdog_tick()
+        self.assertEqual(link.written, [])
+
     def test_watchdog_quiet_on_page_ld(self):
         link = FakeLink()
+        link.write_frame = lambda payload, done=None: link.written.append(bytes(payload))   # no probe answers
         link._last_packet_at = 0.0                        # readings stopped long ago
         link.upload_mode = True
         link._watchdog_tick()
