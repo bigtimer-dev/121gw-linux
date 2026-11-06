@@ -83,3 +83,56 @@ def clock_payload(when: datetime) -> bytes:
     for f in fields:
         check ^= f
     return b"\xF8" + "".join(f"{f:02X}" for f in fields + [check]).encode("ascii")
+
+
+# ---- what each key does (the open firmware's manual, "The keys"; v2.05 behaves the same for these) ------------------
+
+_AC_MODES = {2, 4, 13, 14, 15, 16, 18, 20}                  # MeterMode values (gw121/packet.py)
+_CURRENT_MODES = {16, 17, 18, 19, 20, 21}
+_NO_AUTOHOLD = {6, 7, 8, 12}                                # Hz, ms, %, capacitance: HOLD has no auto-hold step
+
+
+def key_help(key: MeterKey, mode: int | None = None, in_setup: bool = False) -> tuple[str, str | None]:
+    """(what a press does, what holding does or None) for `key`, for the meter's present function `mode` (a MeterMode
+    value, None if not known) and whether a SETUP page is shown."""
+    if in_setup:
+        setup = {
+            MeterKey.SETUP: ("Next settings page", "Edit the page shown; hold again to save"),
+            MeterKey.REL: ("▲ Step the value up (while editing)", None),
+            MeterKey.PEAK: ("▼ Step the value down (while editing)",
+                            "Bluetooth on / off — switching it off disconnects this app"),
+        }
+        if key in setup:
+            return setup[key]
+    if key is MeterKey.MODE:
+        return "Next function of this dial position", "Backlight on / off"
+    if key is MeterKey.RANGE:
+        if mode == 11:
+            return ("Diode test voltage 3 V ↔ 15 V (15 V only on parts that are off and discharged)",
+                    "Back to auto-range")
+        return "Fix the range; press again for the next range up", "Back to auto-range (AUTO)"
+    if key is MeterKey.HOLD:
+        if mode in _NO_AUTOHOLD:
+            return "Freeze the reading → off", None
+        return "Freeze the reading → auto-hold (A-HOLD: keeps each steady reading) → off", None
+    if key is MeterKey.REL:
+        press = "Show the difference to the present reading (REL) on / off"
+        if mode in (9, 12):
+            press += " — short the leads (Ω) or leave them open (capacitance) first to subtract them"
+        if mode in _CURRENT_MODES:
+            return press, "Store a zero offset for this current range"
+        if mode in _AC_MODES:
+            return press, "1 kHz low-pass filter on / off"
+        return press, None
+    if key is MeterKey.PEAK:
+        hold = "Bluetooth on / off — switching it off disconnects this app"
+        if mode in _AC_MODES:
+            return "Catch short peaks on / off", hold
+        return "Catch short peaks (AC functions only; two beeps here)", hold
+    if key is MeterKey.MIN_MAX:
+        return "Start MIN/MAX; each press shows max → min → average → all", "Stop MIN/MAX"
+    if key is MeterKey.MEM:
+        return "Show the last logged readings", "Start / stop logging to the SD card"
+    if key is MeterKey.SETUP:
+        return "Settings: next page on the small display", "Edit the page shown; hold again to save"
+    return key.title, None

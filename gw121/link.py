@@ -14,7 +14,7 @@ from gi.repository import GLib
 
 from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
 from .packet import FrameAssembler, PacketV2
-from .card import (T_STREAM, TIMEOUT_MS, CardError, ReplyParser, StreamParser, repair_reply, request_packet,
+from .card import (fast_types, TIMEOUT_MS, CardError, ReplyParser, StreamParser, repair_reply, request_packet,
                    stream_payload)
 from .setup_pages import SetupText, parse_setup_frames
 from .upload import (BOOTLOADER_INFO_REQUEST, PROBE_SEQ, T_DATA, UPDATE_MODE_REQUEST, AnswerParser, BootSession,
@@ -277,7 +277,11 @@ class MeterLink:
             self.communication_lost = False
             self.changed()
         if boot and self._boot_job is not None and self._boot is None:
-            self._boot_begin()
+            if self._boot_job.get("after_end"):
+                self._boot_finish(False, "The meter came back in its update mode (-IAP-): the bootloader did not "
+                                         "accept the file. Send it again.")
+            else:
+                self._boot_begin()
 
     def _publish(self, pkt: PacketV2) -> None:
         if self.on_ld_page or self.update_mode or self._probe_at:
@@ -364,6 +368,8 @@ class MeterLink:
         if v:
             self.firmware_version = v
             tail.clear()
+            if self._boot_job is not None and self._boot_job.get("after_end"):
+                self._boot_came_back(v)
             self.changed()
         elif len(tail) > 64:
             del tail[:-6]
@@ -392,7 +398,9 @@ class MeterLink:
         self._probe_parser.clear()
         self._upload_finish(False, "Upload stopped: disconnected")
         if self._boot_job is not None:
-            if self._boot is not None:
+            if self._boot is not None and self._boot.phase == "end":
+                self._boot_after_end()              # every byte sent: the meter restarted before its END answer came
+            elif self._boot is not None:
                 self._boot_finish(False, "Disconnected during the transfer. The meter stays in its update mode "
                                          "(-IAP-): connect again and send the file again.")
             else:
@@ -513,7 +521,7 @@ class MeterLink:
                     box["seq"] = self._card_seq
                     box["t0"] = time.monotonic()
                     self._card_stream = box
-                    self._write_pieces(request_packet(T_STREAM, self._card_seq, stream_payload(first, count, size)),
+                    self._write_pieces(request_packet(fast_types(self.firmware_version)[1], self._card_seq, stream_payload(first, count, size)),
                                        None)
                 ready.set()
                 return GLib.SOURCE_REMOVE
@@ -731,11 +739,40 @@ class MeterLink:
         if job is not None and job["state"]:
             job["state"](text)
 
+    def _boot_after_end(self) -> None:
+        """The link dropped after the whole file was sent (the meter checks it and restarts, sometimes before its END
+        answer gets out): wait for the meter to come back and judge by what it reports."""
+        job = self._boot_job
+        if self._boot_timer:
+            GLib.source_remove(self._boot_timer)
+            self._boot_timer = 0
+        self._boot = None
+        self._boot_tx.clear()
+        self._boot_writing = False
+        self._boot_parser.clear()
+        job["after_end"] = job["dropped"] = True
+        self._boot_state("The meter restarted before its answer came: waiting for it to come back…")
+        if self._boot_wait_timer:
+            GLib.source_remove(self._boot_wait_timer)
+        self._boot_wait_timer = GLib.timeout_add_seconds(UPDATE_MODE_WAIT_S, self._boot_wait_timed_out)
+
+    def _boot_came_back(self, version: str) -> None:
+        job = self._boot_job
+        want = job.get("version")
+        if want is None or version == want:
+            self._boot_finish(True, f"Installed: the meter runs {version}.")
+        else:
+            self._boot_finish(False, f"The meter runs {version}, not {want}: the update did not take. Send it again.")
+
     def _boot_wait_timed_out(self) -> bool:
         self._boot_wait_timer = 0
         if self._boot_job is not None and self._boot is None:
-            self._boot_finish(False, "The meter did not come back in its update mode. If it shows -IAP-, connect "
-                                     "again and send the file; otherwise use the SD card route.")
+            if self._boot_job.get("after_end"):
+                self._boot_finish(False, "The meter did not come back after the install. Look at it: with -IAP- on "
+                                         "the display, connect again and send the file again.")
+            else:
+                self._boot_finish(False, "The meter did not come back in its update mode. If it shows -IAP-, connect "
+                                         "again and send the file; otherwise use the SD card route.")
         return GLib.SOURCE_REMOVE
 
     def _boot_begin(self) -> None:

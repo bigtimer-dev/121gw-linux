@@ -34,6 +34,20 @@ def needs_newer(version: str | None) -> str | None:
     return None
 
 
+def format_refused(version: str | None, bootloader: str | None) -> str | None:
+    """Why the meter cannot format its card over Bluetooth (None when it can, or when that is not known yet)."""
+    if bootloader == "B-EEV":
+        return "Formatting over Bluetooth needs zombu4's two-part bootloader (Bootloader… in the main menu)."
+    if version and len(version) >= 6 and version[1] == "-":
+        try:
+            key = tuple(int(x) for x in version[2:].split("."))
+        except ValueError:
+            return None
+        if (version[0] == "F" and key < (1, 9)) or (version[0] == "C" and key < (1, 8)) or version[0] not in "FC":
+            return f"The meter runs {version}: formatting over Bluetooth needs F-1.09 / C-1.08 or later."
+    return None
+
+
 def human_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -52,7 +66,7 @@ class Worker:
         self.cancel_flag = threading.Event()
         self.busy = False
         self.client = CardClient(link.card_request, self.cancel_flag.is_set,
-                                 getattr(link, "card_stream", None))
+                                 getattr(link, "card_stream", None), getattr(link, "firmware_version", None))
         threading.Thread(target=self._run, daemon=True, name="121gw-card").start()
 
     def submit(self, fn: Callable[[CardClient], object], done: Callable[[object, CardError | None], None]) -> None:
@@ -135,7 +149,10 @@ class CardPage(Gtk.Box):
         self.sync_btn.connect("clicked", lambda *_: self.sync())
         self.cancel_btn = Gtk.Button(label="Cancel", visible=False)
         self.cancel_btn.connect("clicked", lambda *_: self.worker.cancel())
-        for b in (self.refresh_btn, self.sync_btn, self.cancel_btn):
+        self.format_btn = Gtk.Button(label="Format Card…", css_classes=["destructive-action"],
+                                     tooltip_text="Erase the meter's SD card (exFAT, as the meter's page Fr does)")
+        self.format_btn.connect("clicked", lambda *_: self.confirm_format())
+        for b in (self.refresh_btn, self.sync_btn, self.cancel_btn, self.format_btn):
             actions.append(b)
         top.add(actions)
 
@@ -201,6 +218,9 @@ class CardPage(Gtk.Box):
         ok = self.link.card_ready and not self.worker.busy
         self.refresh_btn.set_sensitive(ok)
         self.sync_btn.set_sensitive(ok and bool(self.files))
+        why = format_refused(self.link.firmware_version, getattr(self.link, "bootloader", None))
+        self.format_btn.set_sensitive(ok and why is None)
+        self.format_btn.set_tooltip_text(why or "Erase the meter's SD card (exFAT, as the meter's page Fr does)")
         child = self.list_box.get_first_child()
         while child is not None:
             for b in getattr(child, "buttons", ()):
@@ -348,6 +368,43 @@ class CardPage(Gtk.Box):
             self.refresh()
 
         self.worker.submit(lambda c: c.delete(f.name), done)
+
+    def confirm_format(self) -> None:
+        has_cal = any(f.name.lower() == "cal.bin" for f in self.files)
+        body = ("Every file on the meter's SD card is erased and the card is formatted as exFAT, as the meter's "
+                "SETUP page Fr does. The calibration inside the meter is not touched.\n\n")
+        if has_cal:
+            body += ("<b>The card holds cal.bin, the backup of the meter's calibration.</b> Press Sync to Folder first "
+                     "so a copy stays on this computer.\n\n")
+        body += "Type FORMAT to confirm."
+        dlg = Adw.AlertDialog(heading="Format the meter's SD card?", body=body, body_use_markup=True)
+        entry = Gtk.Entry(placeholder_text="FORMAT", activates_default=True)
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("format", "Format")
+        dlg.set_response_appearance("format", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_response_enabled("format", False)
+        dlg.set_close_response("cancel")
+        dlg.set_default_response("cancel")
+        entry.connect("changed", lambda e: dlg.set_response_enabled("format", e.get_text() == "FORMAT"))
+        dlg.connect("response", lambda _d, r: r == "format" and entry.get_text() == "FORMAT" and self._format())
+        dlg.present(self.win)
+
+    def _format(self) -> None:
+        self.banner.set_revealed(False)
+        self.list_group.set_description("Formatting the card… (the meter answers when it has finished, up to a minute)")
+        self.progress_row.set_visible(False)
+
+        def done(_r, error):
+            if error:
+                self.list_group.set_description(None)
+                self._error(f"Format: {error}")
+                return
+            self.win.toast("The card is formatted")
+            self.loaded = False
+            self.refresh()
+
+        self.worker.submit(lambda c: c.format(), done)
 
     # ---- folder ---------------------------------------------------------------
 

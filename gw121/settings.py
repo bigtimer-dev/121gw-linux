@@ -72,7 +72,7 @@ class Settings:
     def normalize_views(self) -> None:
         for key, allowed in (("loop_view", ("off", "4-20", "0-20")), ("rtd_view", ("off", "pt100", "pt1000")),
                              ("rtd_unit", ("°C", "°F")),
-                             ("theme", ("companion", "system"))):
+                             ("theme", ("companion", "purple", "system"))):
             if self._data.get(key) not in allowed:
                 self._data[key] = DEFAULTS[key]
 

@@ -31,7 +31,11 @@ class Palette:
     grid: tuple[float, float, float, float]
     accent: tuple[float, float, float]
     bg: tuple[float, float, float] | None = None
+    fill: float = 0.14                  # area under the line
+    line: float = 2.0
 
+
+CHART_FONT = "Adwaita Sans"            # Inter-based; tabular digits keep the axis labels steady
 
 def fmt_num(v: float) -> str:
     if not math.isfinite(v):
@@ -210,7 +214,7 @@ def draw_chart(cr: cairo.Context, w: float, h: float, points: list[DataPoint], u
     if pal.bg:
         cr.set_source_rgb(*pal.bg)
         cr.paint()
-    cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+    cr.select_font_face(CHART_FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
     fs = 10 * font_scale
 
     def text(s, x, y, rgba, size=fs, anchor="left"):
@@ -227,9 +231,9 @@ def draw_chart(cr: cairo.Context, w: float, h: float, points: list[DataPoint], u
 
     top = 22 * font_scale if title else 4
     if title:
-        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.select_font_face(CHART_FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         text(title, 8, 16 * font_scale, pal.fg, 13 * font_scale)
-        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.select_font_face(CHART_FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
 
     total = len(points)
     base = max(0, total - window) if window else 0
@@ -319,11 +323,11 @@ def draw_chart(cr: cairo.Context, w: float, h: float, points: list[DataPoint], u
             cr.line_to(x, y)
         cr.line_to(pts[-1][0], base_y)
         cr.close_path()
-        cr.set_source_rgba(*pal.accent, 0.14)
+        cr.set_source_rgba(*pal.accent, pal.fill)
         cr.fill()
 
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
-        cr.set_line_width(2 * font_scale)
+        cr.set_line_width(pal.line * font_scale)
         cr.move_to(*pts[0])
         for p in pts[1:]:
             cr.line_to(*p)
@@ -466,6 +470,8 @@ class TrendChart(Gtk.DrawingArea):
             accent = theme.ACCENT_RGB if theme.active else _rgb(Adw.StyleManager.get_default().get_accent_color_rgba())
         except AttributeError:
             accent = (0.21, 0.52, 0.89)
+        if theme.active:                     # minimal: faint grid and labels
+            return Palette(fg=fg, muted=(*fg, 0.4), grid=(*fg, 0.05), accent=accent, fill=0.04, line=1.5)
         return Palette(fg=fg, muted=(*fg, 0.6), grid=(*fg, 0.12), accent=accent)
 
     def _draw(self, _area, cr, w, h) -> None:

@@ -261,6 +261,22 @@ class StreamMeter(Meter):
         return status, field, out
 
 
+class FastTypesTests(unittest.TestCase):
+    def test_only_c107_gets_the_old_numbers(self):
+        self.assertEqual(card.fast_types("C-1.07"), (0x18, 0x19))
+        for v in ("C-1.08", "F-1.12", "F-1.06", "C-1.06", None):
+            self.assertEqual(card.fast_types(v), (0x1A, 0x1B), v)
+
+    def test_slower_never_sends_0x18_to_f112(self):
+        sent = []
+        c = card.CardClient(lambda t, p: (sent.append(t), (0, 0, b""))[1], version="F-1.12")
+        c._slower()
+        self.assertEqual(sent, [0x1A])
+        sent.clear()
+        card.CardClient(lambda t, p: (sent.append(t), (0, 0, b""))[1], version="C-1.07")._slower()
+        self.assertEqual(sent, [0x18])
+
+
 class StreamTests(unittest.TestCase):
     def _download(self, m, name="EEVBlog.bin"):
         c = card.CardClient(m.request, stream=m.stream)

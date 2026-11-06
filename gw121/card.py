@@ -37,8 +37,17 @@ from typing import Callable
 from .upload import crc16, packet
 
 T_LIST, T_READ, T_CHUNK, T_DELETE, T_INFO, T_GET, T_PUT = 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17
+T_FORMAT, FORMAT_WORD = 0x15, b"FORMAT"     # zombu4's F-1.09+ / C-1.08+ with the two-part bootloader (IMP-39)
 T_ANSWER = 0x82
-T_LINK, T_STREAM, T_PIECE = 0x18, 0x19, 0x83     # fast reads (custom firmware C-1.07 on, CF-08)
+T_LINK, T_STREAM, T_PIECE = 0x1A, 0x1B, 0x83     # fast reads (custom firmware C-1.08 on, CF-08)
+OLD_LINK, OLD_STREAM = 0x18, 0x19                  # the same in C-1.07; zombu4's F-1.12 uses 0x18 to restart the meter
+
+
+def fast_types(version: str | None) -> tuple[int, int]:
+    """(LINK, STREAM) request types for the firmware `version`: C-1.07 alone has them at 0x18 / 0x19. Every other
+    firmware gets 0x1A / 0x1B, which one without CF-08 refuses (status 3); 0x18 is never sent to it, because
+    zombu4's F-1.12 and C-1.08 restart into the bootloader's update mode on 0x18."""
+    return (OLD_LINK, OLD_STREAM) if version == "C-1.07" else (T_LINK, T_STREAM)
 CHUNK = 232
 WINDOW = 8192
 MAX_NAME = 63
@@ -54,7 +63,7 @@ PROTECTED = ("cal.bin", "eevblog.bin", "btload.tmp")
 SKIP_SYNC = ("btload.tmp",)
 MANIFEST = ".121gw-sync.json"
 TIMEOUT_MS = {T_LIST: 15_000, T_READ: 30_000, T_CHUNK: 4_000, T_DELETE: 20_000, T_INFO: 30_000, T_GET: 5_000,
-              T_PUT: 8_000}
+              T_PUT: 8_000, T_FORMAT: 180_000}   # FORMAT: f_mkfs writes the file system; the answer comes when done
 _NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._ -")
 
 
@@ -417,8 +426,9 @@ class CardClient:
     STREAM_ROUNDS = 4                # STREAM again for pieces that did not arrive, then CHUNK for the rest
 
     def __init__(self, request: Request, cancelled: Callable[[], bool] = lambda: False,
-                 stream: Stream | None = None) -> None:
+                 stream: Stream | None = None, version: str | None = None) -> None:
         self._request = request
+        self._t_link = fast_types(version)[0]
         self.cancelled = cancelled
         self._stream = stream
         # STREAM support: None not known yet, True the firmware streams (C-1.07 on: paced, idle gaps, measured
@@ -473,6 +483,21 @@ class CardClient:
     def info(self) -> tuple[int, int]:
         return parse_info(*self._ok(T_INFO))
 
+    def format(self) -> None:
+        """Format the card as exFAT, as the meter's page Fr does: every file on it is gone (the calibration in the
+        meter's EEPROM is not touched). Sent once: the meter answers only when it has finished."""
+        try:
+            status, field, _ = self._request(T_FORMAT, FORMAT_WORD)
+        except CardError as e:
+            if e.raw:                       # an answer came, damaged: the meter has finished; the listing shows it
+                return
+            raise CardError("the meter did not answer the format in 3 minutes: look at the meter, then Refresh")
+        if status == ST_NOT_NOW:
+            raise CardError("format refused: the meter needs firmware F-1.09 / C-1.08 or later with zombu4's "
+                            "two-part bootloader, and no firmware transfer may be running", status)
+        if status:
+            raise CardError(f"format failed: {describe(status, field)}", status)
+
     def delete(self, name: str) -> None:
         if is_protected(name):
             raise CardError(f"{name} is protected: the meter needs it", ST_PROTECTED)
@@ -513,7 +538,7 @@ class CardClient:
         if not lower:
             return
         try:
-            status, _, _ = self._ask(T_LINK, struct.pack("<BBbB", lower[0], 1, 0, 2))
+            status, _, _ = self._ask(self._t_link, struct.pack("<BBbB", lower[0], 1, 0, 2))
         except CardError:
             return
         if status == ST_OK:

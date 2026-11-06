@@ -71,6 +71,7 @@ def encode(mode: MeterMode, value: float, range_index: int | None) -> tuple[int,
 
 
 class DemoLink(MeterLink):
+    is_demo = True                      # no SETUP page-text frames: the SETUP list in the key menu is hidden
     def __init__(self, settings) -> None:
         super().__init__(settings)
         self._timer = 0
@@ -175,7 +176,7 @@ class DemoLink(MeterLink):
             if answer:
                 GLib.timeout_add(15, self._echo, answer)
         elif payload == VERSION_REQUEST:                              # as open firmware v1.0.2 (IMP-30)
-            answer = bytes([0xF6]) + b"F-102"
+            answer = bytes([0xF6]) + b"C-108"
             x = 0
             for b in answer:
                 x ^= b
@@ -334,7 +335,7 @@ class DemoSdReceiver:
         payload = body[4:]
         if crc != _up.crc16(body):
             return self._answer(seq, 1, self.expect)
-        if 0x10 <= ptype <= (0x19 if self.files.fast else 0x17):
+        if 0x10 <= ptype <= 0x17 or (self.files.fast and ptype in (0x1A, 0x1B)):
             return self.card_reply(ptype, seq, payload)
         if ptype == _up.T_START:
             self.size, self.crc = struct.unpack("<II", payload)
@@ -423,9 +424,9 @@ class DemoCard:
         if t == 0x12:
             (idx,) = struct.unpack_from("<H", p)
             return self.reply(seq, 0, idx, self.staged[idx * 232:(idx + 1) * 232])
-        if t == 0x18:
+        if t == 0x1A:                                               # LINK (ble/bftfast.s, C-1.08 on)
             return self.reply(seq, 0, 218)
-        if t == 0x19:                                               # STREAM (ble/bftfast.s, C-1.07 on)
+        if t == 0x1B:                                               # STREAM
             first, count, size = struct.unpack_from("<HHB", p)
             n = (len(self.staged) + size - 1) // size - first if size else 0
             if not 1 <= size <= 232 or n <= 0:
@@ -445,6 +446,12 @@ class DemoCard:
             if k is None:
                 return self.reply(seq, 0x20)
             del self.files[k]
+            return self.reply(seq, 0)
+        if t == 0x15:                                               # FORMAT (F-1.09 / C-1.08 on)
+            if p != b"FORMAT":
+                return self.reply(seq, 0x22)
+            self.files.clear()
+            self.staged = b""
             return self.reply(seq, 0)
         if t == 0x14:
             used = sum((len(v[0]) + 32767) // 32768 for v in self.files.values())

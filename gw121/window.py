@@ -13,7 +13,8 @@ from .chart import TrendChart, export_png, fmt_elapsed, fmt_num
 from .bootdialog import BootloaderDialog
 from .cardview import CardPage, MeterSettingsPage, Worker
 from .continuity import ContinuityEngine
-from .keys import KEYPAD, MeterKey
+from .keys import KEYPAD, MeterKey, key_help
+from .navigate import GOTO_REQUEST, Navigator, goto_frame, key_state, max_presses, options_for, supports_goto
 from .lcd import LcdView
 from .livestats import LiveStats
 from .link import MeterLink
@@ -31,7 +32,7 @@ def _safe_filename(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name).strip("_") or "session"
 
 
-def _card(child: Gtk.Widget, margin: int = 12) -> Gtk.Widget:
+def _card(child: Gtk.Widget, margin: int = 16) -> Gtk.Widget:
     frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     frame.add_css_class("card")
     child.set_margin_top(margin)
@@ -54,23 +55,52 @@ class MeterButton(Gtk.Button):
         self.add_css_class("meter-key")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         self.title = Gtk.Label(label=key.title)
-        self.arrow = Gtk.Label(label=key.setup_arrow or "")
+        self.arrow = Gtk.Label(label="")         # what the key has set now (AUTO, 50 V, A-HOLD, MAX, …) or ▲ / ▼
         self.arrow.add_css_class("arrow")
-        self.arrow.set_visible(bool(key.setup_arrow))
+        self.arrow.set_ellipsize(3)               # Pango.EllipsizeMode.END
         box.append(self.title)
         box.append(self.arrow)
         self.set_child(box)
-        self.set_tooltip_text(f"{key.title}  —  key '{key.shortcut.upper()}', Shift+{key.shortcut.upper()} = long press")
+        self._state = None
+        self._context: tuple | None = None
+        self.menu = KeyMenu(self)
+        self.set_context(None, False)
 
         gesture = Gtk.GestureClick()
         gesture.connect("pressed", self._pressed)
         gesture.connect("released", self._released)
         gesture.connect("cancel", lambda *_: self._cancel())
         self.add_controller(gesture)
+        right = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        right.connect("pressed", lambda *_: self.menu.popup())     # right click: the key's menu
+        self.add_controller(right)
 
     def set_setup_mode(self, in_setup: bool) -> None:
-        if self.key.setup_arrow:
-            self.arrow.set_opacity(1.0 if in_setup else 0.45)
+        pass                                      # the state line shows ▲ / ▼ on a SETUP page (set_state)
+
+    def set_state(self, text: str, active: bool) -> None:
+        if self._state == (text, active):
+            return
+        self._state = (text, active)
+        self.arrow.set_label(text)
+        self.arrow.set_visible(bool(text))
+        for w in (self, getattr(self, "cell", None)):
+            if w is not None:
+                (w.add_css_class if active else w.remove_css_class)("active")
+
+    def set_context(self, mode: int | None, in_setup: bool) -> None:
+        """Tooltip and menu for what the key does now (the meter's function, a SETUP page shown)."""
+        if self._context == (mode, in_setup):
+            return
+        self._context = (mode, in_setup)
+        press, hold = key_help(self.key, mode, in_setup)
+        k = self.key.shortcut.upper()
+        esc = GLib.markup_escape_text
+        tip = f"<b>{esc(self.key.title)}</b>\n<b>Press:</b> {esc(press)}"
+        tip += f"\n<b>Hold:</b> {esc(hold)}" if hold else "\n<b>Hold:</b> nothing"
+        tip += f"\n<small>Key {k} · Shift+{k} = hold · right-click or ▾ for the menu</small>"
+        self.set_tooltip_markup(tip)
+        self.menu.update(press, hold)
 
     def _pressed(self, *_):
         self._cancel()
@@ -98,6 +128,89 @@ class MeterButton(Gtk.Button):
             self._timer = 0
 
 
+class KeyMenu(Gtk.MenuButton):
+    """The ▾ next to a meter key (or a right click on it): what it can be set to, then its press and hold."""
+
+    def __init__(self, button: MeterButton):
+        super().__init__(icon_name="pan-down-symbolic", tooltip_text=f"{button.key.title}: choices, press or hold",
+                         css_classes=["meter-key-menu"])
+        self.button = button
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6, width_request=280)
+        self.provider = None            # () -> [navigate.Option]: the states this key can step to
+        self.on_choose = None           # (Option) -> None
+        self.goto_title = Gtk.Label(xalign=0, css_classes=["dim-label", "caption"], margin_start=6,
+                                    label=f"Set {button.key.title} to")
+        self.goto_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["navigation-sidebar"])
+        self.goto_list.connect("row-activated", self._row)
+        self.goto_scroll = Gtk.ScrolledWindow(child=self.goto_list, propagate_natural_height=True,
+                                              max_content_height=360, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        box.append(self.goto_title)
+        box.append(self.goto_scroll)
+        self.sep = Gtk.Separator(margin_top=4, margin_bottom=4)
+        box.append(self.sep)
+        self.items = []
+        for long_press, title, icon in ((False, "Press", "input-mouse-symbolic"),
+                                        (True, "Hold", "preferences-system-time-symbolic")):
+            b = Gtk.Button(css_classes=["flat", "key-action"])
+            line = Gtk.Box(spacing=10)
+            line.append(Gtk.Image(icon_name=icon, valign=Gtk.Align.CENTER))
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            head = Gtk.Label(xalign=0, use_markup=True,
+                             label=f"<b>{title} {GLib.markup_escape_text(button.key.title)}</b>")
+            desc = Gtk.Label(xalign=0, wrap=True, max_width_chars=36, css_classes=["dim-label", "caption"])
+            inner.append(head)
+            inner.append(desc)
+            line.append(inner)
+            b.set_child(line)
+            b.connect("clicked", self._clicked, long_press)
+            box.append(b)
+            self.items.append((b, desc))
+        pop = Gtk.Popover(child=box)
+        pop.connect("show", lambda *_: self._fill())
+        self.set_popover(pop)
+        self._fill()
+
+    def _fill(self) -> None:
+        opts = self.provider() if self.provider else []
+        self._opts = opts
+        while (row := self.goto_list.get_row_at_index(0)) is not None:
+            self.goto_list.remove(row)
+        for o in opts:
+            line = Gtk.Box(spacing=8, margin_top=2, margin_bottom=2)
+            text = GLib.markup_escape_text(o.label)
+            line.append(Gtk.Label(label=f"<b>{text}</b>" if o.current else text, use_markup=True, xalign=0,
+                                  hexpand=True))
+            if o.current:
+                line.append(Gtk.Image(icon_name="object-select-symbolic"))
+            row = Gtk.ListBoxRow(child=line)
+            if o.blocked:
+                row.set_sensitive(False)
+                row.set_tooltip_text(o.blocked)
+                line.append(Gtk.Image(icon_name="action-unavailable-symbolic"))
+            elif o.detail:
+                row.set_tooltip_text(o.detail)
+            self.goto_list.append(row)
+        self.goto_title.set_visible(bool(opts))
+        self.goto_scroll.set_visible(bool(opts))
+        self.sep.set_visible(bool(opts))
+
+    def _row(self, _lb, row) -> None:
+        opt = self._opts[row.get_index()]
+        self.get_popover().popdown()
+        if self.on_choose and not opt.current and not opt.blocked:
+            self.on_choose(opt)
+
+    def update(self, press: str, hold: str | None) -> None:
+        self.items[0][1].set_label(press)
+        self.items[1][1].set_label(hold or "nothing on this key")
+        self.items[1][0].set_sensitive(hold is not None)
+
+    def _clicked(self, _b, long_press: bool) -> None:
+        self.get_popover().popdown()
+        self.button.on_key(self.button.key, long_press)
+
+
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application, link: MeterLink, settings: Settings, store: SessionStore):
         super().__init__(application=app, title="121GW")
@@ -107,6 +220,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings = settings
         self.store = store
         self.continuity = ContinuityEngine(settings)
+        self._nav = None                # a running key navigation (gw121/navigate.py)
         # append-only so the chart summary stays incremental; trimmed only occasionally
         self.preview: list[DataPoint] = []
         self.live_stats = LiveStats()
@@ -142,7 +256,8 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Check for Firmware Update", "win.check-update")
         menu.append("Bootloader…", "win.bootloader")
         theme_menu = Gio.Menu()
-        theme_menu.append("Companion Dark", "win.theme::companion")
+        theme_menu.append("Minimal Yellow", "win.theme::companion")
+        theme_menu.append("Minimal Purple", "win.theme::purple")
         theme_menu.append("System", "win.theme::system")
         menu.append_submenu("Theme", theme_menu)
         menu.append("Keyboard Shortcuts", "win.shortcuts")
@@ -198,17 +313,13 @@ class MainWindow(Adw.ApplicationWindow):
         bar = Gtk.CenterBox()
         bar.set_margin_start(14)
         bar.set_margin_end(14)
-        bar.set_margin_top(6)
-        bar.set_margin_bottom(4)
-        self.rssi_label = Gtk.Label()
-        self.rssi_label.add_css_class("statusbar-label")
-        self.name_label = Gtk.Label()
-        self.name_label.add_css_class("heading")
-        right = Gtk.Box(spacing=10)
-        self.battery_label = Gtk.Label()
-        self.battery_label.add_css_class("statusbar-label")
-        self.time_label = Gtk.Label()
-        self.time_label.add_css_class("statusbar-label")
+        bar.set_margin_top(4)
+        bar.set_margin_bottom(6)
+        self.rssi_label = Gtk.Label(css_classes=["chip"])
+        self.name_label = Gtk.Label(css_classes=["device-name"])
+        right = Gtk.Box(spacing=6)
+        self.battery_label = Gtk.Label(css_classes=["chip"])
+        self.time_label = Gtk.Label(css_classes=["chip"])
         right.append(self.battery_label)
         right.append(self.time_label)
         bar.set_start_widget(self.rssi_label)
@@ -220,11 +331,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.banner.connect("button-clicked", lambda *_: self.upload_action.activate(None))
         outer.append(self.banner)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_top(8)
-        box.set_margin_bottom(24)
-        box.set_margin_start(14)
-        box.set_margin_end(14)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=28)
+        box.set_margin_top(6)
+        box.set_margin_bottom(28)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
 
         self.lcd = LcdView()
         box.append(self.lcd)
@@ -243,23 +354,31 @@ class MainWindow(Adw.ApplicationWindow):
 
         # meter controls
         ctl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        t = Gtk.Label(label="Meter Controls", xalign=0)
+        t = Gtk.Label(label="Keys", xalign=0)
         t.add_css_class("card-title")
         ctl.append(t)
-        grid = Gtk.Grid(column_spacing=6, row_spacing=6, column_homogeneous=True)
+        grid = Gtk.Grid(column_spacing=4, row_spacing=4, column_homogeneous=True)
         self.key_buttons: list[MeterButton] = []
         for i, key in enumerate(KEYPAD):
             b = MeterButton(key, self._send_key)
+            b.set_hexpand(True)
             self.key_buttons.append(b)
-            grid.attach(b, i % 4, i // 4, 1, 1)
+            b.menu.provider = (lambda key=key: options_for(key, self.link) if self.link.is_connected else [])
+            b.menu.on_choose = (lambda opt, key=key: self._navigate(key, opt))
+            cell = Gtk.Box(css_classes=["key-cell"])
+            b.cell = cell
+            cell.append(b)
+            cell.append(b.menu)
+            grid.attach(cell, i % 4, i // 4, 1, 1)
         ctl.append(grid)
         clock = Gtk.Button(action_name="win.sync-clock", halign=Gtk.Align.START,
                            tooltip_text="Set the meter's clock to this computer's time (Ctrl+T). The meter takes "
                                         "one clock update each time its Bluetooth is switched on.")
         clock.set_child(Adw.ButtonContent(icon_name="preferences-system-time-symbolic", label="Sync Meter Clock"))
         clock.add_css_class("flat")
+        clock.set_visible(False)                 # in the main menu (Ctrl+T); the page keeps to the meter itself
         ctl.append(clock)
-        box.append(_card(ctl, 10))
+        box.append(_card(ctl, 14))
 
         # trend
         trend = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -301,10 +420,13 @@ class MainWindow(Adw.ApplicationWindow):
         hint.add_css_class("caption")
         hint.add_css_class("dim-label")
         trend.append(hint)
+        trend.set_tooltip_text(hint.get_label())
+        hint.set_visible(False)
         box.append(_card(trend))
 
         self.log_button = Gtk.Button(label="Start Log", halign=Gtk.Align.CENTER)
         self.log_button.add_css_class("pill")
+        self.log_button.add_css_class("log")
         self.log_button.set_size_request(200, -1)
         self.log_button.connect("clicked", lambda *_: self._toggle_log())
         box.append(self.log_button)
@@ -530,7 +652,7 @@ class MainWindow(Adw.ApplicationWindow):
         head.append(reset)
         box.append(head)
         grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=3, min_children_per_line=3,
-                           column_spacing=6, row_spacing=6, homogeneous=True)
+                           column_spacing=8, row_spacing=8, homogeneous=True)
         self.stat_values: dict[str, Gtk.Label] = {}
         for key, title in self.STAT_TILES:
             tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -545,7 +667,7 @@ class MainWindow(Adw.ApplicationWindow):
             grid.append(Gtk.FlowBoxChild(focusable=False, child=tile))
         box.append(grid)
         self.stats_since.set_label("waiting for readings")
-        return _card(box, 10)
+        return _card(box, 14)
 
     def _reset_live_stats(self) -> None:
         self.live_stats.reset()
@@ -619,14 +741,16 @@ class MainWindow(Adw.ApplicationWindow):
 
         # header row
         if link.is_connected:
-            self.rssi_label.set_label(f"BT  {link.rssi} dBm" if link.rssi is not None else "BT")
-            self.rssi_label.remove_css_class("dim-label")
+            self.rssi_label.set_label(f"{link.rssi} dBm" if link.rssi is not None else "connected")
+            self.rssi_label.add_css_class("live")
         else:
-            self.rssi_label.set_label("BT off")
-            self.rssi_label.add_css_class("dim-label")
+            self.rssi_label.set_label("not connected")
+            self.rssi_label.remove_css_class("live")
         self.name_label.set_label(link.connected_name or "121GW")
+        self.battery_label.set_visible(link.battery_voltage is not None)
+        self.time_label.set_visible(bool(link.meter_time))
         if link.battery_voltage is not None:
-            self.battery_label.set_label(f"{link.battery_voltage:.2f}V")
+            self.battery_label.set_label(f"{link.battery_voltage:.2f} V")
             if link.battery_low:
                 self.battery_label.add_css_class("error")
             else:
@@ -683,9 +807,13 @@ class MainWindow(Adw.ApplicationWindow):
             self.setup_meter.set_label(f"“{st.shown}”")
         self.clock_action.set_enabled(link.is_connected and not link.uploading)
         self.upload_action.set_enabled(link.is_connected or link.uploading)
+        mode = getattr(p, "mode", None) if p is not None else None
         for b in self.key_buttons:
             b.set_sensitive(link.is_connected)
+            b.menu.set_sensitive(link.is_connected)
             b.set_setup_mode(link.in_setup_menu)
+            b.set_context(int(mode) if mode is not None and int(mode) != 255 else None, link.in_setup_menu)
+            b.set_state(*key_state(b.key, link) if link.is_connected else ("", False))
 
         # connect page
         if link.is_connected:
@@ -844,7 +972,46 @@ class MainWindow(Adw.ApplicationWindow):
     # =====================================================================
 
     def _send_key(self, key: MeterKey, long_press: bool) -> None:
+        if self._nav is not None:
+            self._nav.stop("stopped: a key was pressed")
         self.link.send_key(key, long_press)
+
+    def _navigate(self, key: MeterKey, opt) -> None:
+        """Step the meter to the chosen page / function / range (gw121/navigate.py)."""
+        if self._nav is not None:
+            self._nav.stop("replaced")
+        if key is MeterKey.SETUP and self.link.setup_text is not None and self.link.setup_text.editing:
+            self.toast("Finish editing the SETUP page on the meter first (hold SETUP to save)")
+            return
+        options = options_for(key, self.link)
+        self.toast(f"{key.title}: going to {opt.label}…")
+
+        def done(ok, text):
+            self._nav = None
+            self.toast(f"{key.title}: {opt.label}" + ("" if ok else f" — {text}"))
+
+        self._nav = Navigator(self.link, key, opt, done, limit=1 if opt.long_press else max_presses(key, options))
+        direct = None
+        if key is MeterKey.SETUP and supports_goto(self.link) and opt.item is not None:
+            direct = (lambda item=opt.item: self._goto_page(item))
+        self._nav.start(direct)
+
+    def _goto_page(self, item: int) -> None:
+        """CF-09: the meter jumps itself; on the page Ld through the card request (key frames do not arrive there)."""
+        if not self.link.on_ld_page:
+            self.link.write_frame(goto_frame(item), None)
+            return
+        if getattr(self.link, "card_busy", False):
+            self.toast("The card is busy: wait for the card job to finish")
+            return
+
+        def ask():
+            try:
+                self.link.card_request(GOTO_REQUEST, bytes([item]))
+            except Exception as e:                       # noqa: BLE001 — reported, the navigator times out
+                GLib.idle_add(lambda: (self.toast(f"SETUP: {e}"), GLib.SOURCE_REMOVE)[1])
+
+        threading.Thread(target=ask, daemon=True, name="121gw-goto").start()
 
     def _on_key(self, _ctl, keyval, _code, state) -> bool:
         focus = self.get_focus()

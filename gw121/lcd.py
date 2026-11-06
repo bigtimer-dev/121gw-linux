@@ -36,7 +36,10 @@ CSS = """
 .lcd separator { background-color: alpha(#1f241f, 0.25); }
 .meter-key { font-weight: 700; min-height: 44px; padding: 2px 4px; }
 .meter-key.pressed { background-color: alpha(@accent_bg_color, 0.35); }
-.meter-key .arrow { font-size: 8pt; opacity: 0.75; }
+.meter-key .arrow { font-size: 8pt; font-weight: 400; opacity: 0.8; }
+.meter-key.active { box-shadow: inset 0 -3px @accent_bg_color; }
+.meter-key.active .arrow { opacity: 1; color: @accent_color; }
+.meter-key-menu > button { min-width: 16px; min-height: 44px; padding: 0 2px; }
 .statusbar-label { font-family: monospace; font-size: 9pt; font-weight: 700; }
 .card-title { font-size: 10pt; opacity: 0.7; }
 .mono { font-family: monospace; }
@@ -87,25 +90,52 @@ class BarGraph(Gtk.DrawingArea):
         self.queue_draw()
 
     def _draw(self, _a, cr, w, h) -> None:
+        from . import theme
+        modern = theme.active
+        on_rgb = (0.91, 0.90, 0.87) if modern else INK
+        off = (1.0, 1.0, 1.0, 0.045) if modern else (*INK, 0.13)
+        text_rgb = (0.55, 0.54, 0.50) if modern else INK
         dim = 0.13
         sign_w = 14
         x0, x1 = sign_w, w - 34
         seg_w = (x1 - x0) / 26
-        cr.select_font_face("monospace", 0, 1)
+        cr.select_font_face("Adwaita Sans" if modern else "monospace", 0, 1)
         cr.set_font_size(9)
+
+        def bar(x, y, bw, bh):
+            if not modern:
+                cr.rectangle(x, y, bw, bh)
+                return
+            r = min(1.0, bw / 2, bh / 2)
+            cr.new_sub_path()
+            cr.arc(x + bw - r, y + r, r, -1.5708, 0)
+            cr.arc(x + bw - r, y + bh - r, r, 0, 1.5708)
+            cr.arc(x + r, y + bh - r, r, 1.5708, 3.1416)
+            cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+            cr.close_path()
+
         # sign
-        cr.set_source_rgba(*INK, 1 if self.used and self.negative else dim)
-        cr.rectangle(2, 7, 8, 2.4)
+        if self.used and self.negative:
+            cr.set_source_rgba(*on_rgb, 1)
+        else:
+            cr.set_source_rgba(*off)
+        bar(2, 7, 8, 2.4)
         cr.fill()
         # segments
         for i in range(26):
             on = self.used and i < self.segments
-            cr.set_source_rgba(*INK, 1 if on else dim)
-            cr.rectangle(x0 + i * seg_w + 0.8, 4, seg_w - 1.6, 9 if i % 5 else 12)
+            if on:
+                cr.set_source_rgba(*on_rgb, 1)
+            else:
+                cr.set_source_rgba(*off)
+            if modern:
+                bar(x0 + i * seg_w + 1.0, 8, seg_w - 2.0, 2)
+            else:
+                bar(x0 + i * seg_w + 0.8, 4, seg_w - 1.6, 9 if i % 5 else 12)
             cr.fill()
         # ticks
         labels = ["0", "2", "4", "6", "8", "10"] if self.wide_scale else ["0", "1", "2", "3", "4", "5"]
-        cr.set_source_rgba(*INK, 0.85 if self.used else dim)
+        cr.set_source_rgba(*text_rgb, (0.5 if self.used else 0.0) if modern else (0.85 if self.used else dim))
         for k, t in enumerate(labels):
             x = x0 + k * 5 * seg_w
             ext = cr.text_extents(t)

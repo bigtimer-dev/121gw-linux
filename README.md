@@ -14,6 +14,8 @@ Pure Python + PyGObject. BLE goes straight to BlueZ over D-Bus, so there is **no
 **Card** and **Meter** (zombu4's open firmware `F-1.05` or later, custom `C-1.06` or later; fast downloads with `C-1.07`)
 
 Put the meter on its SETUP page `Ld-bt` (SETUP, then REL / PEAK to the page after `bt`; logging off). Then:
+- **Format Card…** (Card page; firmware `F-1.09` / `C-1.08` or later with zombu4's two-part bootloader): erases the
+  card as exFAT, as the meter's page `Fr` does, after you type FORMAT; warns first when the card holds `cal.bin`.
 - **Card**: lists the files on the meter's SD card with size and date, and the free space. Download a file, delete
   one (after a confirmation; `cal.bin`, `EEVBlog.bin` and `BTLOAD.TMP` can't be deleted, the meter needs them), or
   **Sync to Folder**: copies new and changed files into a local folder (default `~/Documents/121GW card`, the
@@ -45,8 +47,9 @@ the meter reports:
   emulator up to the meter's refusals: EEVblog's bootloader image isn't available here.
 - Either way the app waits until the meter reports the new version. Calibration and settings are never written.
 
-**Theme**: *Companion Dark* (the default) follows the look of zombu4's 121GW Companion: near-black, warm grey
-text and the meter's yellow as the only accent. *System* (main menu → Theme) uses the desktop's own colours.
+**Theme** (main menu → Theme): *Minimal Yellow* (the default) and *Minimal Purple* are a minimal dark look: no boxes,
+one thin reading, indicators shown only while on, keys as plain words (▾ on hover, or right-click a key) with the
+accent colour only where something is active. *System* uses the desktop's own colours.
 
 **Live**
 - LCD replica: BT, AUTO, 1kHz, 1ms, LowZ, BAT, APO, DC / AC / DC+AC, DIODE, CONT, REL, HOLD,
@@ -59,7 +62,15 @@ text and the meter's yellow as the only accent. *System* (main menu → Theme) u
 - Warnings: communication lost (5 s watchdog), battery low (≤ 4.5 V) and near power-off (≤ 4.2 V), also
   as desktop notifications when the window is in the background
 - Remote keys HOLD / MODE / REL▲ / RANGE / MIN-MAX / MEM / PEAK▼ / SETUP with short and long press
-  (MODE long ≈ backlight); REL / PEAK act as ▲ / ▼ in the SETUP menu
+  (MODE long ≈ backlight); REL / PEAK act as ▲ / ▼ in the SETUP menu. Hover a key to see what a press and a hold do
+  in the meter's present function (e.g. RANGE in diode = 3 V / 15 V test voltage, REL hold in AC = 1 kHz filter, in
+  current = zero offset); the ▾ next to each key lists both and sends either one
+- **Go to** lists in the same ▾ menus: pick a function (MODE: e.g. DC V / AC V / AC+DC V), a range (RANGE: Auto,
+  5 V … 600 V, 50 Ω … 50 MΩ, diode 3 V / 15 V), HOLD / auto-hold, MIN / MAX / AVG, or a SETUP page; the current one is
+  ticked. The app presses the key and checks the meter after every press until it is there. SETUP pages need the
+  custom firmware's page text (`C-1.03`+); with `C-1.08`+ the meter jumps to the page itself (CF-09), also past
+  `Ld` and back to the normal display. With older firmware the pages after `Ld` are greyed out: on `Ld` the meter
+  ignores keys from the app
 - **Sync Meter Clock** (button under the keys, main menu or `Ctrl+T`): sets the meter's clock to the computer's
   local time, so SD-card log files get the right date. The meter confirms by echoing the frame. Open firmware
   `F-1.01` / `C-1.02` and later take every clock frame, so you can sync again at any time. v2.05 and older open

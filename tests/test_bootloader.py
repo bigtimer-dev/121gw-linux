@@ -293,6 +293,50 @@ class BootLinkTests(unittest.TestCase):
         self.assertTrue(wait(lambda: link.restarts == 2, 3))       # into the bootloader, back into the firmware
         link._stop_watchdog()
 
+    def test_end_answer_lost_in_the_restart(self):
+        """Every byte sent, the meter restarts before its END answer gets out (seen on a meter 2026-11-05): the link
+        waits for the meter to come back and judges by the version it reports."""
+        from gw121.keys import VERSION_REQUEST
+        for comes_back, ok in ((b"C-108", True), (b"C-107", False)):
+            link, data = BootLink(), image(6000)
+            link._start_watchdog()
+            orig_later, orig_write = link._later, link.write_frame
+
+            def later(d, link=link, orig=orig_later):
+                if link.mode != "firmware" and link.boot.state == "done":
+                    return                              # the END answer is lost
+                orig(d)
+
+            def write(payload, done=None, link=link, orig=orig_write, comes_back=comes_back):
+                if link.mode == "firmware" and payload == VERSION_REQUEST:
+                    ans = b"\xF6" + comes_back
+                    x = 0
+                    for b in ans:
+                        x ^= b
+                    link.written.append(bytes(payload))
+                    if done:
+                        GLib.idle_add(lambda: (done(None), GLib.SOURCE_REMOVE)[1])
+                    orig_later(payload + ans + bytes([x]))
+                    return
+                orig(payload, done)
+
+            link._later, link.write_frame = later, write
+            states, result = [], []
+            link.install_firmware(data, lambda *_: None, lambda ok_, t: result.append((ok_, t)), states.append)
+            link._boot_job["version"] = "C-1.08"       # the test image carries no version table
+            self.assertTrue(wait(lambda: link.boot.state == "done", 30))
+            self.assertFalse(result, "no verdict while the meter restarts")
+            self.assertTrue(wait(lambda: link.mode == "firmware" and link.is_connected, 5))
+            for i in range(14):
+                if result:
+                    break
+                link.ingest(build_frame(1, 100 + i, 1))
+                spin(0.05)
+            self.assertTrue(wait(lambda: result, 5), states)
+            self.assertEqual(result[0][0], ok, result)
+            self.assertTrue(any("restarted before its answer" in s for s in states), states)
+            link._stop_watchdog()
+
     def test_update_with_lost_packets(self):
         link, data = BootLink(), image(8000)
         n = [0]
