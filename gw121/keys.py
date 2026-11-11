@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
@@ -34,6 +35,46 @@ class MeterKey(Enum):
 # Firmware version request of zombu4's open firmware v1.0.1+ (IMP-30): a key frame with the unused code 0x90, echoed like
 # any key frame and answered with F6 + the five characters of the power-on version + XOR. v2.05 ignores the code.
 VERSION_REQUEST = bytes([0xF4, 0x39, 0x30, 0x39, 0x30])
+CLOCK_REQUEST = bytes([0xF4, 0x39, 0x36, 0x39, 0x36])   # key code 0x96: custom C-1.09+ measures its clock, answers FB
+MSI_NOMINAL_HZ = 4_194_304
+
+
+@dataclass
+class ClockReport:
+    """Frame FB (custom firmware CF-10, sys/msical.s): the meter's MSI clock measured against its 4 MHz crystal."""
+    boot_hz: int            # measured at power-on
+    hz: int                 # the value the baud rate was set from
+    now_hz: int             # measured for this request (0: could not be measured now)
+    trim: int
+    status: int
+    brr: int
+
+    @property
+    def baud(self) -> float:
+        return self.hz / self.brr if self.brr else 0.0
+
+    def text(self) -> str:
+        f = self.now_hz or self.hz
+        ppm = (f - MSI_NOMINAL_HZ) / MSI_NOMINAL_HZ * 1e6
+        return (f"Meter clock {f / 1e6:.4f} MHz ({ppm:+.0f} ppm from nominal), Bluetooth {self.baud:.0f} baud "
+                f"({(self.baud / 19200 - 1) * 100:+.2f} %)")
+
+
+def parse_clock_report(buf: bytes) -> ClockReport | None:
+    """The first valid 20-byte FB frame in buf (XOR of bytes 0..18 in byte 19), else None."""
+    i = buf.find(0xFB)
+    while 0 <= i <= len(buf) - 20:
+        f = buf[i:i + 20]
+        x = 0
+        for b in f[:19]:
+            x ^= b
+        if x == f[19]:
+            boot, hz = int.from_bytes(f[1:5], "little"), int.from_bytes(f[5:9], "little")
+            if 3_000_000 < hz < 5_500_000:
+                return ClockReport(boot, hz, int.from_bytes(f[15:19], "little"), f[9], f[10],
+                                   int.from_bytes(f[13:15], "little"))
+        i = buf.find(0xFB, i + 1)
+    return None
 
 
 def parse_version_answer(buf: bytes) -> str | None:

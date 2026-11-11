@@ -14,6 +14,7 @@ from typing import Callable
 
 from gi.repository import GLib
 
+from .card import custom_key, setpage_type
 from .keys import MeterKey
 from .packet import MODE_NAMES, RANGES, Coupling, MeterMode as M, unit_string
 from .setup_pages import PAGES
@@ -217,17 +218,19 @@ def setup_options(link) -> list[Option]:
 
 
 def supports_goto(link) -> bool:
-    """Custom firmware C-1.08+ (CF-09) jumps to a SETUP page itself: key code 0xC0 + item, request 0x1C on Ld."""
+    """Custom firmware C-1.08+ (CF-09) jumps to a SETUP page itself: key code 0xC0 + item, request SETPAGE on Ld."""
     v = link.firmware_version or ""
     if getattr(link, "is_demo", False) or not v.startswith("C-"):
         return False
     try:
-        return float(v[2:]) >= 1.08
+        return (custom_key(v) or (0, 0)) >= (1, 8)
     except ValueError:
         return False
 
 
-GOTO_REQUEST = 0x1C                     # card-protocol request on the page Ld: SETPAGE item(1)
+def goto_request(version: str | None) -> int:
+    """Card-protocol request on the page Ld: SETPAGE item(1) (0x1C in C-1.08 / C-1.09, 0x1F since C-1.10)."""
+    return setpage_type(version)
 
 
 def goto_frame(item: int) -> bytes:
@@ -242,7 +245,7 @@ def can_navigate_setup(link) -> bool:
     if getattr(link, "is_demo", False) or not v.startswith("C-"):
         return False
     try:
-        return float(v[2:]) >= 1.03
+        return (custom_key(v) or (0, 0)) >= (1, 3)
     except ValueError:
         return False
 

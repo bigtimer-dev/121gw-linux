@@ -335,7 +335,7 @@ class DemoSdReceiver:
         payload = body[4:]
         if crc != _up.crc16(body):
             return self._answer(seq, 1, self.expect)
-        if 0x10 <= ptype <= 0x17 or (self.files.fast and ptype in (0x1A, 0x1B)):
+        if 0x10 <= ptype <= 0x17 or (self.files.fast and ptype in (0x1A, 0x1B, 0x1D, 0x1E)):
             return self.card_reply(ptype, seq, payload)
         if ptype == _up.T_START:
             self.size, self.crc = struct.unpack("<II", payload)
@@ -390,7 +390,9 @@ class DemoCard:
         }
         self.staged = b""
         self.settings = {0x00F: 0, 0x010: 1, 0x011: 0, 0x013: 0, 0x014: 3, 0x015: 1, 0x016: 0, 0x017: 31,
-                         0x01A: 13, 0x01B: 0, 0x01E: 1, 0x020: 0, 0x021: 0, 0x022: 10, 0x028: 0, 0x029: 0, 0x02A: 100}
+                         0x01A: 13, 0x01B: 0, 0x01E: 1, 0x020: 0, 0x021: 0, 0x022: 10, 0x028: 0, 0x029: 0, 0x02A: 100,
+                         0x02B: 0, 0x02C: 0, 0x02F: 50}
+        self.wide = {0x02D: 30, 0x018: 1}  # two-byte settings (F-1.33 / C-1.10): GET flags 1, PUT id(2) value(2)
 
     @staticmethod
     def reply(seq: int, status: int, field: int = 0, data: bytes = b"") -> bytes:
@@ -424,9 +426,9 @@ class DemoCard:
         if t == 0x12:
             (idx,) = struct.unpack_from("<H", p)
             return self.reply(seq, 0, idx, self.staged[idx * 232:(idx + 1) * 232])
-        if t == 0x1A:                                               # LINK (ble/bftfast.s, C-1.08 on)
+        if t in (0x1A, 0x1D):                                       # LINK (ble/bftfast.s; 0x1D since C-1.10)
             return self.reply(seq, 0, 218)
-        if t == 0x1B:                                               # STREAM
+        if t in (0x1B, 0x1E):                                       # STREAM (0x1E since C-1.10)
             first, count, size = struct.unpack_from("<HHB", p)
             n = (len(self.staged) + size - 1) // size - first if size else 0
             if not 1 <= size <= 232 or n <= 0:
@@ -457,9 +459,22 @@ class DemoCard:
             used = sum((len(v[0]) + 32767) // 32768 for v in self.files.values())
             return self.reply(seq, 0, 64, struct.pack("<II", 242000 - used, 242304))
         if t == 0x16:
+            if len(p) == 3 and p[2] == 1:                           # IMP-64: every setting, two-byte values, pages
+                items = list(self.settings.items()) + list(self.wide.items())
+                part = items[p[0]:p[0] + p[1]]
+                end = 0x8000 if p[0] + len(part) >= len(items) else 0
+                return self.reply(seq, 0, len(part) | end, b"".join(struct.pack("<HH", k, v) for k, v in part))
+            if p:
+                return self.reply(seq, 0x22)
             return self.reply(seq, 0, len(self.settings), b"".join(struct.pack("<HB", k, v)
                                                                      for k, v in self.settings.items()))
         if t == 0x17:
+            if len(p) == 4:
+                wid, v = struct.unpack_from("<HH", p)
+                if wid not in self.wide:
+                    return self.reply(seq, 0x22)
+                self.wide[wid] = v
+                return self.reply(seq, 0, wid, struct.pack("<H", v))
             wid, v = struct.unpack_from("<HB", p)
             if wid not in self.settings:
                 return self.reply(seq, 0x22)

@@ -26,7 +26,9 @@ Put the meter on its SETUP page `Ld-bt` (SETUP, then REL / PEAK to the page afte
   nor misreads bytes (`CF-08`). Older firmware works too, in 100-byte pieces at about 0.18 KB/s, with damaged answers
   asked again and their copies combined. Full speed needs the 7.5 ms Bluetooth interval (see **Speed** under *Upload Firmware* below);
   at a longer interval the app asks the meter to send slower.
-- **Meter**: the meter's SETUP settings (buzzer, continuity threshold and hold, auto power-off, backlight auto-off,
+- **Meter**: the meter's SETUP settings (buzzer incl. `quiet` on `C-1.10`, continuity threshold and hold, with
+  `C-1.10` / `F-1.33` the user threshold `th` and hysteresis `HY`, the DIODE chirp, the auto power-off time,
+  capacitance anti-hunting and the logging interval, auto power-off, backlight auto-off,
   battery trim, LCD contrast, display level, REL view, clock, temperature unit, thermocouple type, dBm reference,
   current-loop and RTD views, VA burden, Bluetooth rate, logging trigger and change threshold). A change goes to the
   meter at once; the meter applies and stores it exactly as its own SETUP page does, so the app never writes the
@@ -69,13 +71,25 @@ accent colour only where something is active. *System* uses the desktop's own co
   5 V … 600 V, 50 Ω … 50 MΩ, diode 3 V / 15 V), HOLD / auto-hold, MIN / MAX / AVG, or a SETUP page; the current one is
   ticked. The app presses the key and checks the meter after every press until it is there. SETUP pages need the
   custom firmware's page text (`C-1.03`+); with `C-1.08`+ the meter jumps to the page itself (CF-09), also past
-  `Ld` and back to the normal display. With older firmware the pages after `Ld` are greyed out: on `Ld` the meter
+  `Ld` and back to the normal display (`C-1.10`: also into zombu4's second SETUP walk behind `SEt`). With older firmware the pages after `Ld` are greyed out: on `Ld` the meter
   ignores keys from the app
 - **Sync Meter Clock** (button under the keys, main menu or `Ctrl+T`): sets the meter's clock to the computer's
   local time, so SD-card log files get the right date. The meter confirms by echoing the frame. Open firmware
   `F-1.01` / `C-1.02` and later take every clock frame, so you can sync again at any time. v2.05 and older open
   firmware take one clock update each time Bluetooth is switched on: to sync again, hold **PEAK** on the meter
   (Bluetooth off), hold it again (on) and sync.
+- **Measure Meter Oscillator** (main menu; custom firmware `C-1.09`+, CF-10): the meter measures its internal clock
+  (MSI) against its 4 MHz crystal and the app shows the result, e.g. `Meter clock 4.2019 MHz (+1811 ppm from nominal),
+  Bluetooth 19186 baud (-0.07 %)`. That clock sets the Bluetooth baud rate; frequency readings use the measuring
+  chip's own crystal, and the meter's real-time clock its own 32 kHz crystal, so neither depends on it.
+- **Key buttons**: a click sends a short press, holding the button for 0.6 s (MODE 1 s) a long press. (Before this
+  version GTK 4 swallowed the short click of a button: REL / PEAK did nothing while a SETUP page was being edited.)
+- **Key presses confirmed**: the meter echoes every key frame. With `C-1.09`+ (clean Bluetooth bytes, CF-12) a key
+  whose echo does not come within 0.6 s is sent once more (status `Sent HOLD (again: the first frame was lost)`); with
+  older firmware about one echo in four arrives damaged, so a resend could press a toggle key twice: the app only says
+  `the meter did not confirm the key`.
+- **Link quality**: when reading frames arrive damaged, the Connect row says which share of the last 20 s
+  (e.g. `25 % of readings damaged`; firmware before `C-1.09` damages about a quarter of them, `C-1.09` none).
 - **Firmware version**: on connect the app asks the meter for its firmware version (open firmware v1.0.1 and later
   answer, e.g. `C-1.02`) and shows it next to the meter on the Connect row. v2.05 and older open firmware ignore the
   request; nothing changes on the meter.
@@ -280,14 +294,25 @@ firmware keeps the Bluetooth frame format, the key codes and the clock frame unc
   EEPROM offset and value). Answers `B5 5B 82 seq(2) len status field(2) data crc16(2)`, one request at a time;
   answers with damaged first bytes are repaired as for the upload, when their CRC-16 proves it, and damaged copies of
   one answer are combined byte by byte (`combine_copies`, accepted only with a matching CRC-16).
-  Custom firmware `C-1.07`+ (`CF-08`): `0x19` STREAM `first(2) count(2) size(1)` sends the staged bytes as pieces
+  Custom firmware `C-1.07`+ (`CF-08`): STREAM `first(2) count(2) size(1)` sends the staged bytes as pieces
   `B5 5B 83 idx(2) len data crc16(2)` without a request each (the app uses 232-byte pieces, the CHUNK indexes, and
-  asks again for any that did not arrive); `0x18` LINK `pace stop trim [gap]` sets the meter's sending (RAM only; the
+  asks again for any that did not arrive); LINK `pace stop trim [gap]` sets the meter's sending (RAM only; the
   app lowers the pace from 13 to 6 or 3 bytes per 10 ms when pieces get lost). Firmware without them answers `0x81`
-  status 3, and the app uses CHUNKs.
+  status 3, and the app uses CHUNKs. The numbers moved with zombu4's own requests: LINK / STREAM are `0x18` / `0x19`
+  in `C-1.07`, `0x1A` / `0x1B` in `C-1.08` / `C-1.09` and `0x1D` / `0x1E` since `C-1.10`; SETPAGE `item(1)` (CF-09,
+  go to a SETUP page from `Ld`) is `0x1C` in `C-1.08` / `C-1.09` and `0x1F` since `C-1.10`. The app picks them by the
+  meter's version (`gw121/card.py` `fast_types`, `setpage_type`) and never sends `0x18` to `C-1.08`+ or zombu4's
+  `F-1.12`+ (there it restarts the meter into update mode).
+- Settings, two-byte form (zombu4's `F-1.33` / `C-1.10`): GET with the payload `start max flags=1` answers entries
+  `id(2) value(2)` in pages (field bit 15: the last page), PUT `id(2) value(2)`; the app uses it for the user
+  continuity threshold `0x02D` and the logging interval `0x018`, and falls back to the plain GET on older firmware.
 - Version request (open firmware v1.0.1+): `F4 39 30 39 30`; the meter echoes it and answers `F6` + five ASCII
   characters (`C-102`, shown as `C-1.02`) and an XOR byte that makes the XOR of all seven bytes zero
   (`gw121/keys.py` `parse_version_answer`).
+- Clock measurement (custom firmware `C-1.09`+, CF-10): key code `0x96` (`F4 39 36 39 36`); the meter echoes it and
+  answers `FB` + 19 bytes: MSI at power-on u32, MSI the baud rate was set from u32, trim, status, steps u16, USART
+  BRR u16, MSI measured now u32 (0 if it could not be), XOR of the 19 bytes before (`gw121/keys.py`
+  `parse_clock_report`).
 - SETUP page text (custom firmware `C-1.03`+, `CF-07`): while a SETUP page is shown the meter also sends
   `FA item c0..c4 flags units 00 xor` (`F7` in `C-1.03`) (11 bytes): the page number, the five characters of the small display, the
   decimal point (flags bits 0..2), minus (bit 4), editing (bit 5), unit icons (V, A, m, k, Hz, dB, Ω) and an XOR byte

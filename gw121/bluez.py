@@ -562,4 +562,6 @@ class BluezLink(MeterLink):
         def done(err):
             self.set_status(f"Write failed: {err}" if err else self.key_status(key, long_press))
 
-        self.write_frame(key.payload(long_press), done)
+        frame = key.payload(long_press)
+        self.write_frame(frame, done)
+        self.confirm_key(frame, key.title, lambda: self.write_frame(frame, None))

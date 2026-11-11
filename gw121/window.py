@@ -14,7 +14,7 @@ from .bootdialog import BootloaderDialog
 from .cardview import CardPage, MeterSettingsPage, Worker
 from .continuity import ContinuityEngine
 from .keys import KEYPAD, MeterKey, key_help
-from .navigate import GOTO_REQUEST, Navigator, goto_frame, key_state, max_presses, options_for, supports_goto
+from .navigate import goto_request, Navigator, goto_frame, key_state, max_presses, options_for, supports_goto
 from .lcd import LcdView
 from .livestats import LiveStats
 from .link import MeterLink
@@ -66,11 +66,15 @@ class MeterButton(Gtk.Button):
         self.menu = KeyMenu(self)
         self.set_context(None, False)
 
+        # The press starts the hold timer; the short press is the button's own "clicked".  A Gtk.Button claims the
+        # click at the release, so an added GestureClick gets "cancel" there instead of "released" and a short press
+        # sent from "released" was lost (REL / PEAK did nothing while a SETUP page was edited; holds still worked).
         gesture = Gtk.GestureClick()
         gesture.connect("pressed", self._pressed)
-        gesture.connect("released", self._released)
+        gesture.connect("released", lambda *_: self._cancel())
         gesture.connect("cancel", lambda *_: self._cancel())
         self.add_controller(gesture)
+        self.connect("clicked", self._clicked)
         right = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
         right.connect("pressed", lambda *_: self.menu.popup())     # right click: the key's menu
         self.add_controller(right)
@@ -115,8 +119,9 @@ class MeterButton(Gtk.Button):
 
         self._timer = GLib.timeout_add(self.key.long_press_ms, fire)
 
-    def _released(self, *_):
+    def _clicked(self, *_):
         was_long = self._long_fired
+        self._long_fired = False
         self._cancel()
         if not was_long:
             self.on_key(self.key, False)
@@ -251,6 +256,7 @@ class MainWindow(Adw.ApplicationWindow):
         header.set_title_widget(switcher)
         menu = Gio.Menu()
         menu.append("Sync Meter Clock", "win.sync-clock")
+        menu.append("Measure Meter Oscillator", "win.measure-clock")
         menu.append_submenu("Meter Views", self._views_menu())
         menu.append("Upload Firmware…", "win.upload-firmware")
         menu.append("Check for Firmware Update", "win.check-update")
@@ -277,6 +283,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.clock_action = Gio.SimpleAction.new("sync-clock", None)
         self.clock_action.connect("activate", lambda *_: self._sync_clock())
         self.add_action(self.clock_action)
+        act = Gio.SimpleAction.new("measure-clock", None)
+        act.connect("activate", lambda *_: self.link.measure_clock(self.toast))
+        self.add_action(act)
         self.upload_action = Gio.SimpleAction.new("upload-firmware", None)
         self.upload_action.connect("activate", lambda *_: UploadDialog(self).present(self))
         self.add_action(self.upload_action)
@@ -824,6 +833,9 @@ class MainWindow(Adw.ApplicationWindow):
             title, icon = "Disconnected", "bluetooth-disabled-symbolic"
         self.conn_row.set_title(GLib.markup_escape_text(title))
         sub = f"{link.status_text} · {link.packets_received} packets" if link.packets_received else link.status_text
+        q = link.link_quality() if link.is_connected else None
+        if q and q[1]:
+            sub += f" · {q[1] * 100 // (q[0] + q[1])} % of readings damaged (last 20 s)"
         if link.firmware_version:
             sub += f" · firmware {link.firmware_version}"
         if link.update_mode:
@@ -1007,7 +1019,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         def ask():
             try:
-                self.link.card_request(GOTO_REQUEST, bytes([item]))
+                self.link.card_request(goto_request(self.link.firmware_version), bytes([item]))
             except Exception as e:                       # noqa: BLE001 — reported, the navigator times out
                 GLib.idle_add(lambda: (self.toast(f"SETUP: {e}"), GLib.SOURCE_REMOVE)[1])
 

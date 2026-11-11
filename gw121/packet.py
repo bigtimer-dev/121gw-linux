@@ -865,6 +865,7 @@ class FrameAssembler:
 
     def __init__(self) -> None:
         self.buffer = bytearray()
+        self.rejected = 0       # 0xF2 starts whose 19 bytes failed the check: damaged readings (link quality)
 
     def feed(self, data: bytes) -> list[PacketV2]:
         if not data:
@@ -884,6 +885,7 @@ class FrameAssembler:
                 out.append(pkt)
                 offset += LENGTH
             else:
+                self.rejected += 1
                 offset += 1
         if offset:
             del buf[:offset]

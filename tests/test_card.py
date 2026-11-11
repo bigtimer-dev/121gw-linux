@@ -100,6 +100,33 @@ class CardTests(unittest.TestCase):
         with self.assertRaises(card.CardError):
             card.wire_value(card.SETTINGS_BY_ID[0x01A], 30, raw)
 
+    def test_settings_two_byte_and_new(self):
+        m = Meter()
+        c = card.CardClient(m.request)
+        raw = c.get_settings()
+        self.assertEqual(raw[0x02D], 30)                    # two-byte setting through GET flags 1
+        self.assertEqual(raw[0x018], 1)
+        self.assertEqual(raw[0x02F], 50)
+        self.assertEqual(c.put_setting(0x02D, 470, wide=True), 470)
+        self.assertEqual(c.get_settings()[0x02D], 470)
+        hunt = card.SETTINGS_BY_ID[0x420]
+        b = card.wire_value(hunt, 1, {0x020: 0b0101})
+        self.assertEqual(b, 0b10101)                        # bit 4 kept, bits 3..0 unchanged
+        self.assertEqual(card.settings_values({0x020: b})[0x420], 1)
+
+    def test_settings_old_firmware_plain_get(self):
+        m = Meter()
+        c = card.CardClient(m.request)
+        orig = m.request
+        def old(t, p=b""):
+            if t == card.T_GET and p:
+                return orig(t, b"\xff")                     # an older firmware: any payload refused (0x22)
+            return orig(t, p)
+        c._request = old
+        raw = c.get_settings()
+        self.assertNotIn(0x02D, raw)
+        self.assertEqual(raw[0x01E], 1)
+
     def test_repair_damaged_answer(self):
         ans = DemoCard.reply(0x4005, 0, 3, b"abc")
         bad = bytearray(ans)
@@ -262,16 +289,28 @@ class StreamMeter(Meter):
 
 
 class FastTypesTests(unittest.TestCase):
-    def test_only_c107_gets_the_old_numbers(self):
+    def test_numbers_by_version(self):
         self.assertEqual(card.fast_types("C-1.07"), (0x18, 0x19))
-        for v in ("C-1.08", "F-1.12", "F-1.06", "C-1.06", None):
+        for v in ("C-1.08", "C-1.09"):
             self.assertEqual(card.fast_types(v), (0x1A, 0x1B), v)
+        for v in ("C-1.10", "C-1.11", "F-1.33", "F-1.12", "F-1.06", "C-1.06", None):
+            self.assertEqual(card.fast_types(v), (0x1D, 0x1E), v)
+
+    def test_setpage_by_version(self):
+        for v in ("C-1.08", "C-1.09"):
+            self.assertEqual(card.setpage_type(v), 0x1C, v)
+        for v in ("C-1.10", "C-1.12", None):
+            self.assertEqual(card.setpage_type(v), 0x1F, v)
+
+    def test_custom_key_orders_two_digit_minor(self):
+        self.assertGreater(card.custom_key("C-1.10"), card.custom_key("C-1.09"))
+        self.assertIsNone(card.custom_key("F-1.33"))
 
     def test_slower_never_sends_0x18_to_f112(self):
         sent = []
         c = card.CardClient(lambda t, p: (sent.append(t), (0, 0, b""))[1], version="F-1.12")
         c._slower()
-        self.assertEqual(sent, [0x1A])
+        self.assertEqual(sent, [0x1D])                  # never 0x18 (restart) nor 0x1A (READZ since F-1.32)
         sent.clear()
         card.CardClient(lambda t, p: (sent.append(t), (0, 0, b""))[1], version="C-1.07")._slower()
         self.assertEqual(sent, [0x18])

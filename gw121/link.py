@@ -12,9 +12,10 @@ from typing import Callable
 
 from gi.repository import GLib
 
-from .keys import VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload, parse_version_answer
+from .keys import (CLOCK_REQUEST, VERSION_REQUEST, MeterKey, clock_applies_every_time, clock_payload,
+                   parse_clock_report, parse_version_answer)
 from .packet import FrameAssembler, PacketV2
-from .card import (fast_types, TIMEOUT_MS, CardError, ReplyParser, StreamParser, repair_reply, request_packet,
+from .card import (custom_key, fast_types, TIMEOUT_MS, CardError, ReplyParser, StreamParser, repair_reply, request_packet,
                    stream_payload)
 from .setup_pages import SetupText, parse_setup_frames
 from .upload import (BOOTLOADER_INFO_REQUEST, PROBE_SEQ, T_DATA, UPDATE_MODE_REQUEST, AnswerParser, BootSession,
@@ -79,6 +80,9 @@ class MeterLink:
         self._clock_when: datetime | None = None
         self._clock_cb: Callable[[str], None] | None = None
         self._clock_tail = bytearray()
+        self._key_wait: dict | None = None  # the last key frame until the meter echoes it (confirm_key)
+        self._clock_report: dict | None = None  # a clock measurement request (measure_clock) until its FB answer
+        self._quality: deque = deque()      # (time, readings, damaged) samples for link_quality
         self._clock_timer = 0
         self._clock_repeat = False
         self._clock_synced = False      # a clock frame was echoed on this connection
@@ -242,6 +246,10 @@ class MeterLink:
             self._match_bootloader(data)
         if self._clock_frame is not None:
             self._match_clock_echo(data)
+        if self._key_wait is not None:
+            self._match_key_echo(data)
+        if self._clock_report is not None:
+            self._match_clock_report(data)
         if self.firmware_version is None and self._version_asks:
             self._match_version(data)
         self._match_setup(data)
@@ -438,6 +446,110 @@ class MeterLink:
     def _clock_written(self, error: str | None) -> None:
         if error:
             self._clock_finish(f"Clock not sent: {error}")
+
+    # ---- link quality --------------------------------------------------------
+
+    QUALITY_S = 20.0
+
+    def link_quality(self) -> tuple[int, int] | None:
+        """(readings, damaged readings) over the last QUALITY_S seconds; None before there are any."""
+        now = time.monotonic()
+        q = self._quality
+        q.append((now, self.packets_received, self._assembler.rejected))
+        while len(q) > 2 and now - q[1][0] > self.QUALITY_S:
+            q.popleft()
+        good, bad = q[-1][1] - q[0][1], q[-1][2] - q[0][2]
+        return (good, bad) if good + bad else None
+
+    # ---- meter clock measurement (custom C-1.09+, CF-10) --------------------
+
+    def supports_clock_report(self) -> bool:
+        return self.key_resend_safe()       # the same versions: custom C-1.09 and later
+
+    def measure_clock(self, on_result: Callable[[str], None]) -> None:
+        """Ask the meter to measure its MSI clock against the 4 MHz crystal (key code 0x96, answer FB)."""
+        if not self.is_connected:
+            on_result("Not connected")
+            return
+        if not self.supports_clock_report():
+            on_result("Clock measurement needs custom firmware C-1.09 or later")
+            return
+        if self.on_ld_page:
+            on_result("Leave the page Ld first (the meter does not take key frames there)")
+            return
+        if self._clock_report is not None:
+            return
+        box = {"cb": on_result, "buf": bytearray()}
+        box["timer"] = GLib.timeout_add(2500, self._clock_report_timeout, box)
+        self._clock_report = box
+        self.write_frame(CLOCK_REQUEST, None)
+
+    def _match_clock_report(self, data: bytes) -> None:
+        box = self._clock_report
+        box["buf"] += data
+        rep = parse_clock_report(bytes(box["buf"]))
+        if rep is not None:
+            GLib.source_remove(box["timer"])
+            self._clock_report = None
+            box["cb"](rep.text())
+        elif len(box["buf"]) > 512:
+            del box["buf"][:-40]
+
+    def _clock_report_timeout(self, box: dict) -> bool:
+        if self._clock_report is box:
+            self._clock_report = None
+            box["cb"]("The meter did not answer the clock measurement")
+        return GLib.SOURCE_REMOVE
+
+    # ---- key echo ------------------------------------------------------------
+
+    KEY_ECHO_MS = 600       # the echo comes within about 100 ms (measured 2026-11-07: 60 of 60 within 0.4 s)
+
+    def key_resend_safe(self) -> bool:
+        """Custom C-1.09+ (CF-12) sends clean bytes on every page, so a missing echo means the key frame was lost and
+        sending it again cannot press the key twice.  Older firmware damages about one echo in four (measured), so
+        there a missing echo only gets a warning: a resend could toggle HOLD / REL back."""
+        if getattr(self, "is_demo", False):
+            return False
+        return (custom_key(self.firmware_version) or (0, 0)) >= (1, 9)
+
+    def confirm_key(self, frame: bytes, title: str, resend: Callable[[], None]) -> None:
+        """Wait for the meter's echo of a key frame; without one, send it again once (key_resend_safe) or say that
+        the meter did not confirm it.  Not on page Ld (key frames are not echoed there)."""
+        if self.on_ld_page:
+            return
+        if self._key_wait is not None and self._key_wait.get("timer"):
+            GLib.source_remove(self._key_wait["timer"])
+        box = {"frame": bytes(frame), "title": title, "tail": bytearray(), "tries": 0, "resend": resend}
+        box["timer"] = GLib.timeout_add(self.KEY_ECHO_MS, self._key_timed_out, box)
+        self._key_wait = box
+
+    def _match_key_echo(self, data: bytes) -> None:
+        box = self._key_wait
+        tail = box["tail"]
+        tail += data
+        if box["frame"] in tail:
+            if box.get("timer"):
+                GLib.source_remove(box["timer"])
+            self._key_wait = None
+            if box["tries"]:
+                self.set_status(f"Sent {box['title']} (again: the first frame was lost)")
+        elif len(tail) > 64:
+            del tail[:-8]
+
+    def _key_timed_out(self, box: dict) -> bool:
+        box["timer"] = 0
+        if self._key_wait is not box:
+            return GLib.SOURCE_REMOVE
+        if box["tries"] == 0 and self.key_resend_safe() and self.is_connected:
+            box["tries"] = 1
+            box["tail"].clear()
+            box["resend"]()
+            box["timer"] = GLib.timeout_add(self.KEY_ECHO_MS, self._key_timed_out, box)
+        else:
+            self._key_wait = None
+            self.set_status(f"{box['title']}: the meter did not confirm the key")
+        return GLib.SOURCE_REMOVE
 
     def _match_clock_echo(self, data: bytes) -> None:
         frame, tail = self._clock_frame, self._clock_tail

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import zlib
 from dataclasses import dataclass
@@ -39,15 +40,36 @@ from .upload import crc16, packet
 T_LIST, T_READ, T_CHUNK, T_DELETE, T_INFO, T_GET, T_PUT = 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17
 T_FORMAT, FORMAT_WORD = 0x15, b"FORMAT"     # zombu4's F-1.09+ / C-1.08+ with the two-part bootloader (IMP-39)
 T_ANSWER = 0x82
-T_LINK, T_STREAM, T_PIECE = 0x1A, 0x1B, 0x83     # fast reads (custom firmware C-1.08 on, CF-08)
+T_LINK, T_STREAM, T_PIECE = 0x1D, 0x1E, 0x83     # fast reads (custom firmware CF-08) since C-1.10
+MID_LINK, MID_STREAM = 0x1A, 0x1B                  # the same in C-1.08 / C-1.09; zombu4's F-1.32+ uses 0x1A (READZ), 0x1B (WHERE)
 OLD_LINK, OLD_STREAM = 0x18, 0x19                  # the same in C-1.07; zombu4's F-1.12 uses 0x18 to restart the meter
+T_SETPAGE, MID_SETPAGE = 0x1F, 0x1C                # CF-09 SETPAGE on Ld: C-1.10+, C-1.08 / C-1.09 (F-1.33: 0x1C = SHOW)
+
+
+def custom_key(version: str | None) -> tuple[int, int] | None:
+    """(major, minor) of a custom version "C-A.BC" (C-1.10 -> (1, 10)), None for any other firmware."""
+    m = re.fullmatch(r"C-(\d+)\.(\d+)", version or "")
+    return (int(m[1]), int(m[2])) if m else None
 
 
 def fast_types(version: str | None) -> tuple[int, int]:
-    """(LINK, STREAM) request types for the firmware `version`: C-1.07 alone has them at 0x18 / 0x19. Every other
-    firmware gets 0x1A / 0x1B, which one without CF-08 refuses (status 3); 0x18 is never sent to it, because
-    zombu4's F-1.12 and C-1.08 restart into the bootloader's update mode on 0x18."""
-    return (OLD_LINK, OLD_STREAM) if version == "C-1.07" else (T_LINK, T_STREAM)
+    """(LINK, STREAM) request types for the firmware `version`: C-1.07 has them at 0x18 / 0x19, C-1.08 / C-1.09 at
+    0x1A / 0x1B; every other firmware gets 0x1D / 0x1E, which one without CF-08 refuses (status 3).  0x18 is never sent
+    to it, because zombu4's F-1.12 and C-1.08 restart into the bootloader's update mode on 0x18, and 0x1A / 0x1B are
+    zombu4's READZ / WHERE since F-1.32 / F-1.33."""
+    k = custom_key(version)
+    if k == (1, 7):
+        return OLD_LINK, OLD_STREAM
+    if k in ((1, 8), (1, 9)):
+        return MID_LINK, MID_STREAM
+    return T_LINK, T_STREAM
+
+
+def setpage_type(version: str | None) -> int:
+    """CF-09 SETPAGE request type on the page Ld: 0x1C in C-1.08 / C-1.09, 0x1F since C-1.10."""
+    return MID_SETPAGE if custom_key(version) in ((1, 8), (1, 9)) else T_SETPAGE
+
+
 CHUNK = 232
 WINDOW = 8192
 MAX_NAME = 63
@@ -331,6 +353,7 @@ class Setting:
     shift: int = 0
     mask: int = 0xFF
     help: str = ""
+    wide: bool = False      # a two-byte setting (F-1.33 / C-1.10: GET flags 1, PUT id(2) value(2))
 
     @property
     def wire_id(self) -> int:
@@ -349,15 +372,29 @@ def value_text(s: Setting, v: int) -> str:
         return f"{(v - 100) * 0.2:+.1f} %"
     if s.id == 0x022:
         return f"{v} counts"
+    if s.id == 0x02D:
+        return f"{v} Ω"
+    if s.id == 0x02F:
+        return f"{v / 10:.1f} Ω"
+    if s.id == 0x018:
+        return f"{v} s"
     return str(v)
 
 
 B20 = 0x020
 SETTINGS: tuple[Setting, ...] = (
-    Setting(0x01E, "3", "Buzzer", 0, 1, ("off", "on"), "Sound"),
-    Setting(0x014, "10", "Continuity threshold", 0, 15, None, "Sound", help="Code 0..15 of the BEEP page"),
+    Setting(0x01E, "3", "Buzzer", 0, 2, ("off", "on", "quiet (keys silent, measurement beeps on)"), "Sound",
+            help="quiet: F-1.24 / C-1.10 or later"),
+    Setting(0x014, "10", "Continuity threshold", 0, 17, None, "Sound",
+            help="Code 0..15 of the BEEP page; 16 DNUSr / 17 UPUSr use th and HY (F-1.33 / C-1.10)"),
+    Setting(0x02D, "th", "Continuity user threshold", 1, 500, None, "Sound", help="ohm, for DNUSr / UPUSr", wide=True),
+    Setting(0x02F, "HY", "Continuity user hysteresis", 1, 250, None, "Sound", help="tenths of an ohm (50 = 5.0 Ω)"),
+    Setting(0x02C, "CHIrP", "DIODE contact chirp", 0, 1, ("off (beep on every jump)", "on (one beep per contact)"),
+            "Sound"),
     Setting(0x021, "bH", "Continuity beep hold", 0, 3, ("100 ms", "50 ms", "25 ms", "off (15 ms)"), "Sound"),
     Setting(0x016, "2", "Auto power-off", 0, 1, ("on", "disabled"), "Power"),
+    Setting(0x02B, "2", "Auto power-off time", 0, 3, ("30 min", "1 min", "15 min", "60 min"), "Power",
+            help="doubled while MIN/MAX is on"),
     Setting(0x017, "bL", "Backlight auto-off", 0, 100, None, "Power", help="0 = never, 1 = 30 s, n = n − 1 minutes"),
     Setting(0x02A, "BAT", "Battery voltage trim", 50, 150, None, "Power", help="Steps of 0.2 %"),
     Setting(0x01A, "4", "LCD contrast", 10, 17, None, "Display"),
@@ -370,11 +407,14 @@ SETTINGS: tuple[Setting, ...] = (
     Setting(0x028, "LP", "Current loop view (DC mA)", 0, 2, ("off", "4–20 mA", "0–20 mA"), "Measuring"),
     Setting(0x029, "Pt", "RTD view (Ω)", 0, 2, ("off", "Pt100", "Pt1000"), "Measuring"),
     Setting(0x01B, "11", "VA burden “bd”", 0, 1, ("off", "on"), "Measuring"),
+    Setting(0x420, "HUnt", "Capacitance anti-hunting", 0, 1, ("off", "on"), "Measuring", wire=B20, shift=4, mask=0x01,
+            help="CAP auto range stays on 1 µF for a 10..100 nF capacitor that range 1 cannot time"),
     Setting(0x015, "bt", "Bluetooth readings", 0, 3, ("2 per second", "4 per second", "10 per second",
                                                         "20 per second"), "Logging and Bluetooth"),
     Setting(0x220, "tr", "Logging trigger", 0, 2, ("interval", "on change", "on limit verdict"),
             "Logging and Bluetooth", wire=B20, shift=1, mask=0x03),
     Setting(0x022, "Ch", "Logging change threshold", 1, 255, None, "Logging and Bluetooth"),
+    Setting(0x018, "In", "Logging interval", 0, 999, None, "Logging and Bluetooth", help="seconds", wide=True),
 )
 SETTINGS_BY_ID = {s.id: s for s in SETTINGS}
 
@@ -395,7 +435,7 @@ def wire_value(s: Setting, value: int, raw: dict[int, int]) -> int:
     if s.wire < 0:
         return value
     old = raw.get(s.wire, 0)
-    return (old & ~(s.mask << s.shift) & 0x0F) | (value << s.shift)
+    return (old & ~(s.mask << s.shift) & 0x1F) | (value << s.shift)     # bits 4..0 (bit 4 HUnt, IMP-45)
 
 
 # ---- the operations (worker thread) -----------------------------------------------------------------------------
@@ -685,15 +725,32 @@ class CardClient:
 
     # settings
     def get_settings(self) -> dict[int, int]:
-        """The meter's raw setting bytes by wire id."""
+        """The meter's raw setting values by wire id: with two-byte values (GET start max flags 1, F-1.33 / C-1.10),
+        else the one-byte GET of older firmware."""
+        try:
+            out, start = {}, 0
+            for _ in range(16):
+                field, data = self._ok(T_GET, bytes([start, 255, 1]))
+                n = field & 0x7FFF
+                for i in range(min(n, len(data) // 4)):
+                    sid, v = struct.unpack_from("<HH", data, 4 * i)
+                    out[sid] = v
+                if field & 0x8000 or n == 0:
+                    return out
+                start += n
+            return out
+        except CardError as e:
+            if e.status != ST_ARG:                   # older firmware: GET takes no payload (or start max only)
+                raise
         field, data = self._ok(T_GET)
         return parse_get(field, data)
 
-    def put_setting(self, wire_id: int, value: int) -> int:
-        field, data = self._ok(T_PUT, put_payload(wire_id, value))
+    def put_setting(self, wire_id: int, value: int, wide: bool = False) -> int:
+        payload = struct.pack("<HH", wire_id, value) if wide else put_payload(wire_id, value)
+        field, data = self._ok(T_PUT, payload)
         if field != wire_id or not data:
             raise CardError("the meter answered for another setting")
-        return data[0]
+        return struct.unpack_from("<H", data)[0] if wide and len(data) >= 2 else data[0]
 
 
 _DEVICES = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}

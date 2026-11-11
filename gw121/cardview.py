@@ -482,7 +482,7 @@ class MeterSettingsPage(Gtk.Box):
             row.set_subtitle(sub)
             row.set_update_policy(Gtk.SpinButtonUpdatePolicy.IF_VALID)
             row.connect("notify::value", lambda r, _p, s=s: self._spin_changed(s, r))
-            if s.id in (0x017, 0x02A, 0x022):      # the number alone does not say it: its meaning in the subtitle
+            if s.id in (0x017, 0x02A, 0x022, 0x02D, 0x02F, 0x018):      # the number alone does not say it: its meaning in the subtitle
                 row.connect("notify::value", lambda r, _p, s=s, sub=sub:
                             r.set_subtitle(f"{sub}\n= {s.label(int(r.get_value()))}"))
         row.set_sensitive(False)
@@ -581,4 +581,4 @@ class MeterSettingsPage(Gtk.Box):
                 self.win.toast(f"{s.title}: {s.label((now >> s.shift) & s.mask)}")
             self._show()
 
-        self.worker.submit(lambda c: c.put_setting(s.wire_id, byte), done)
+        self.worker.submit(lambda c: c.put_setting(s.wire_id, byte, s.wide), done)
